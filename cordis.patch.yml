@@ -1,0 +1,41 @@
+# dsh-ssh-terminal 插件的 cordis 补丁。
+#
+# M1 起主机表的主存位置是 `ctx.storageDomain` 的 `dsh_ssh` 域（hosts + secrets
+# 两张表），这里的 `config` 只做两件事：
+#   1. 首次启动的**播种**：`hosts` 列表为空时把下面这台写进域里（只播一次，
+#      之后用户增删改都不再被 patch 覆盖）；
+#   2. 运行时行为开关（缓冲上限、自动开服、传输白名单等）。
+# 密码仍然只能放在 patch 里做一次性播种，落域前会用 DEK 加密（见 src/vault.js）。
+- insert:
+    - id: dsh-ssh-terminal
+      name: 'dsh-ssh-terminal'
+      config:
+        # 播种主机的远端。默认本机 22 端口——macOS 需在"系统设置 → 通用 →
+        # 共享"里打开"远程登录"，否则连接会以 ECONNREFUSED 结束。
+        host: 120.53.14.173
+        port: 22
+        # 留空时取 process.env.USER（Host 侧环境变量），仍为空则连接必然失败。
+        username: root
+        # 一次性播种口令：只在域里还没有任何主机时使用，加密后存 secrets 表。
+        # **不要把真口令写在这里**——patch 文件是明文。留空，让用户在界面表单
+        # 里填一次（表单的密码框永不回填），或走 POST /hosts 由保险库存管。
+        password: ''
+        # 每个会话滚动缓冲的上限：行数与字节数谁先超谁截断。
+        maxBufferLines: 2000
+        maxBufferBytes: 524288
+        # 插件激活时若无任何会话，自动打开第一台已保存的主机（用户手动关完
+        # 之后不再自动重连——只在"一个会话都没有"时生效）。播种主机还没填口令
+        # 时建议关掉，否则激活即红灯。
+        autoOpenFirst: false
+        # DEK 的托管方：credentials 走 ctx.credentials（$DSH_HOME 下 0600 文件）；
+        # 留作字符串是为了将来接 OS 钥匙串/passphrase KEK 时不用改配置形状。
+        vaultProvider: credentials
+        # 模型侧 ssh_upload / ssh_download 的总开关。默认关闭：写远端文件是
+        # 有破坏性的动作，必须显式开启。
+        allowTransfer: false
+        # 允许上传/下载的本地根目录。留空 = process.cwd()；任何解析后跳出该
+        # 目录的路径（含 ..）一律拒绝，错误码 path-outside-root。
+        transferRoot: ''
+        # 注：客户端的保活运行时上限是代码常量 `src/client/store.js` 的
+        # MAX_KEPT_RUNTIMES（默认 8），不是配置项——Host 侧无法对客户端强制，
+        # 所以这里不再放一个读了却不生效的开关。

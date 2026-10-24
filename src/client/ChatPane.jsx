@@ -1,39 +1,20 @@
 /**
- * 右栏：会话上下文卡（M3 方案 A）。
+ * 右栏：AI 助手（对话 → 读面板 → 生成命令 → 执行）。
  *
- * ── 为什么不是原生对话 ────────────────────────────────────────────────
- * `renderFactorySlot` 是**宿主注入的 prop**，不可 import（设计 §0.2 已核实：
- * ui-slots 的 `PropsRenderFactories` 只把它放在 props 上，而启动台 view 的
- * viewProps 只有 `{appId, app, back, open, t, active}`）。再加上槽必须由
- * 父级 children 先声明、`conversation.content` 是 session-maybe 作用域，
- * 根作用域下只能渲染空白。所以本轮交付「上下文卡 + 建议指令」，数据来自
- * 我们自己的 `GET /api/dsh-ssh/context`，不碰 dsh 内部会话 API。
+ * 这不是"上下文卡 + 建议指令"了：本文件实现一个完整的对话面板——
+ * 用户大白话输入 → Host 侧 `POST /chat`（SSE）跑模型轮 → 文本流式渲染 →
+ * 模型要跑命令时弹命令卡：默认**人工确认**（点"执行"才跑，走
+ * `POST /chat/exec`，marker 捕获输出回给模型续跑），也可开"自动执行"
+ * 让模型自己连轴转。对话状态在 store 的模块级 `chats` 表里，切标签不丢。
  *
- * ── 未来替换点（唯一）────────────────────────────────────────────────
- * 本文件只有一个地方需要动：`renderConversation()`。上游启动台补上
- * `renderFactorySlot` 之后，把它的函数体换成下面这一行即可，头部、宽度、
- * 折叠逻辑一个字都不用改：
- *
- *   return renderFactorySlot(
- *     'conversation.content',
- *     { variant: 'embedded', phase, hero },
- *     { slots: { views: FixedChatConversationView } },
- *   );
- *
- * ── 数据契约（Host 侧并行实现中）──────────────────────────────────────
- * `GET /api/dsh-ssh/context?sid=` → `{sid, host, status, tail, gap}`。
- * 拿不到（404 / 网络失败 / 接口还没上）时 store 记 'unavailable'，这里显示
- * 「暂无上下文」——可选接口绝不允许把右栏打崩。
+ * 与启动台的耦合只有一句话：本组件不拿 ctx，数据全走模块级 store。
  */
-import React, { useEffect, useSyncExternalStore } from 'react';
+import React, { useEffect, useRef, useSyncExternalStore } from 'react';
 import { ChatIcon, ChevronLeftIcon, ChevronRightIcon } from './icons.js';
 import { actions, getState, subscribe } from './store.js';
 import { t } from './locales.js';
 
-/** 上下文卡里展示的输出行数（设计 §3：最后 12 行）。 */
-const TAIL_LINES = 12;
-
-/** 头部行：标题 + 收起按钮。 */
+/** 头部行：标题 + 模型选择 + 自动执行 + 收起按钮。 */
 const headerStyle = {
   display: 'flex',
   alignItems: 'center',
@@ -53,186 +34,340 @@ const iconButtonStyle = {
   width: '24px',
   height: '24px',
   padding: 0,
-  border: 0,
+  border: '0.5px solid var(--dsw-alias-border-l2)',
   borderRadius: '6px',
   cursor: 'pointer',
   color: 'var(--dsw-alias-label-tertiary)',
   background: 'transparent',
 };
 
-/** 状态 -> 状态灯颜色（与左栏同一套语义）。 */
-const LIGHT_COLORS = {
-  open: 'var(--dsw-alias-brand-primary)',
-  connecting: 'var(--dsw-alias-label-tertiary)',
-  closed: 'var(--dsw-alias-label-tertiary)',
-  error: 'var(--dsw-alias-label-error)',
-  offline: 'var(--dsw-alias-label-quaternary)',
+/** 消息区与输入区的等宽字体栈。 */
+const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
+
+/** 行内 code 样式。 */
+const inlineCodeStyle = {
+  padding: '1px 4px',
+  borderRadius: '4px',
+  background: 'var(--dsw-alias-bg-layer-2)',
+  fontFamily: MONO,
+  fontSize: '0.92em',
 };
 
-/** 状态 -> 状态文案 key。 */
-const STATUS_KEYS = {
-  open: 'statusOpen',
-  connecting: 'statusConnecting',
-  closed: 'statusClosed',
-  error: 'statusError',
-  offline: 'statusOffline',
+/** 代码块样式。 */
+const codeBlockStyle = {
+  margin: '6px 0',
+  padding: '8px',
+  borderRadius: '6px',
+  border: '0.5px solid var(--dsw-alias-border-l2)',
+  background: 'var(--dsw-alias-bg-layer-2)',
+  color: 'var(--dsw-alias-label-secondary)',
+  fontFamily: MONO,
+  fontSize: '11px',
+  lineHeight: '16px',
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-all',
+  overflowX: 'auto',
+};
+
+/** 命令卡状态 → 颜色（成功=品牌色，失败=错误色，其余=弱化）。 */
+const CALL_COLORS = {
+  awaiting: 'var(--dsw-alias-label-tertiary)',
+  running: 'var(--dsw-alias-brand-primary)',
+  done: 'var(--dsw-alias-brand-primary)',
+  failed: 'var(--dsw-alias-label-error)',
+  skipped: 'var(--dsw-alias-label-quaternary)',
+};
+
+/** 命令卡状态 → 文案 key。 */
+const CALL_LABELS = {
+  awaiting: 'chatRun',
+  running: 'chatRunning2',
+  done: 'chatDone',
+  failed: 'chatFailed',
+  skipped: 'chatSkipped',
 };
 
 /**
- * 把 tail 归一成字符串数组：Host 可能给字符串（带 \n），也可能给数组。
- * @param {string|string[]|null|undefined} tail 输出尾巴。
- * @returns {string[]} 行数组。
+ * 行内富文本：`code` 与 **bold**。不做完整 markdown——终端场景够用即可。
+ * @param {string} text 纯文本。
+ * @returns {React.ReactNode[]} 节点数组。
  */
-function toLines(tail) {
-  if (Array.isArray(tail)) return tail.map((line) => String(line));
-  if (typeof tail === 'string') return tail.split('\n');
-  return [];
-}
-
-/**
- * 复制文本到剪贴板：优先异步 API，失败回退到隐藏 textarea + execCommand。
- * @param {string} text 待复制文本。
- * @returns {Promise<boolean>} 是否成功。
- */
-async function copyText(text) {
-  try {
-    if (typeof navigator !== 'undefined' && navigator.clipboard !== undefined) {
-      await navigator.clipboard.writeText(text);
-      return true;
+function inlineNodes(text) {
+  /** @type {React.ReactNode[]} */
+  const nodes = [];
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  let last = 0;
+  let match = pattern.exec(text);
+  while (match !== null) {
+    if (match.index > last) nodes.push(text.slice(last, match.index));
+    const token = match[0];
+    if (token.startsWith('`')) {
+      nodes.push(
+        <code key={`c${match.index}`} style={inlineCodeStyle}>
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else {
+      nodes.push(<strong key={`b${match.index}`}>{token.slice(2, -2)}</strong>);
     }
-  } catch {
-    // 权限被拒 / 非安全上下文：走回退路径。
+    last = match.index + token.length;
+    match = pattern.exec(text);
   }
-  try {
-    const area = document.createElement('textarea');
-    area.value = text;
-    area.setAttribute('readonly', 'readonly');
-    area.style.position = 'fixed';
-    area.style.opacity = '0';
-    document.body.appendChild(area);
-    area.select();
-    const ok = typeof document.execCommand === 'function' ? document.execCommand('copy') : false;
-    area.remove();
-    return ok;
-  } catch {
-    return false;
-  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
 }
 
 /**
- * 上下文卡的一行「小标题 + 右侧动作」。
- * @param {{title: string, action?: React.ReactNode}} props 参数。
- * @returns {JSX.Element} 小标题行。
+ * 段落富文本：``` 代码块 + 行内格式。未闭合的代码块按到文本末尾算。
+ * @param {{text: string}} props 参数。
+ * @returns {JSX.Element} 渲染结果。
  */
-function SectionTitle({ title, action = null }) {
+function RichText({ text }) {
+  /** @type {Array<{kind: string, value: string}>} */
+  const segments = [];
+  const fence = /```[\w-]*\n?([\s\S]*?)(?:```|$)/g;
+  let last = 0;
+  let match = fence.exec(text);
+  while (match !== null) {
+    if (match.index > last) segments.push({ kind: 'text', value: text.slice(last, match.index) });
+    segments.push({ kind: 'code', value: match[1].replace(/\n$/, '') });
+    last = fence.lastIndex;
+    match = fence.exec(text);
+  }
+  if (last < text.length) segments.push({ kind: 'text', value: text.slice(last) });
+  return (
+    <>
+      {segments.map((segment, index) =>
+        segment.kind === 'code' ? (
+          <pre key={`seg${index}`} style={codeBlockStyle}>
+            {segment.value}
+          </pre>
+        ) : (
+          <span key={`seg${index}`}>{inlineNodes(segment.value)}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+/**
+ * 命令卡：一条待执行/已执行的命令。
+ *
+ * awaiting 状态给"执行/跳过"两个按钮（人工确认模式的核心交互）；
+ * 其余状态展示结果摘要，输出折叠在 <details> 里（可能很长）。
+ * @param {{sid: string, call: object}} props 参数。
+ * @returns {JSX.Element} 命令卡。
+ */
+function CallCard({ sid, call }) {
+  const color = CALL_COLORS[call.status] ?? CALL_COLORS.awaiting;
+  const label = t(CALL_LABELS[call.status] ?? 'chatRun');
   return (
     <div
       style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: '6px',
-        margin: '14px 0 6px',
-        fontSize: '11px',
-        fontWeight: 600,
-        letterSpacing: '0.03em',
-        color: 'var(--dsw-alias-label-tertiary)',
+        margin: '6px 0',
+        borderRadius: '8px',
+        border: `0.5px solid ${color}`,
+        background: 'var(--dsw-alias-bg-layer-2)',
+        overflow: 'hidden',
       }}
     >
-      <span style={{ flex: '1 1 auto' }}>{title}</span>
-      {action}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 8px' }}>
+        <span aria-hidden="true" style={{ width: '6px', height: '6px', borderRadius: '50%', background: color, flex: '0 0 auto' }} />
+        <span style={{ flex: '0 0 auto', fontSize: '10px', fontWeight: 600, color }}>{label}</span>
+        {call.timedOut === true ? (
+          <span style={{ flex: '0 0 auto', fontSize: '10px', color: 'var(--dsw-alias-label-error)' }}>{t('chatTimeout')}</span>
+        ) : null}
+      </div>
+      <pre
+        style={{
+          margin: 0,
+          padding: '0 8px 8px',
+          fontFamily: MONO,
+          fontSize: '11px',
+          lineHeight: '16px',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-all',
+          color: 'var(--dsw-alias-label-primary)',
+        }}
+      >
+        {call.command}
+      </pre>
+      {call.status === 'awaiting' ? (
+        <div style={{ display: 'flex', gap: '6px', padding: '0 8px 8px' }}>
+          <button
+            type="button"
+            onClick={() => void actions.resolveToolCall(sid, call.id, true)}
+            style={{
+              padding: '4px 12px',
+              border: '0.5px solid var(--dsw-alias-brand-primary)',
+              borderRadius: '6px',
+              cursor: 'pointer',
+              font: 'inherit',
+              fontSize: '11px',
+              color: 'var(--dsw-alias-brand-primary)',
+              background: 'transparent',
+            }}
+          >
+            {t('chatRun')}
+          </button>
+          <button
+            type="button"
+            onClick={() => void actions.resolveToolCall(sid, call.id, false)}
+            style={{
+              padding: '4px 12px',
+              border: '0.5px solid var(--dsw-alias-border-l2)',
+              borderRadius: '6px',
+              cursor: 'pointer',
+              font: 'inherit',
+              fontSize: '11px',
+              color: 'var(--dsw-alias-label-tertiary)',
+              background: 'transparent',
+            }}
+          >
+            {t('chatSkip')}
+          </button>
+        </div>
+      ) : null}
+      {call.status !== 'awaiting' && call.output !== '' ? (
+        <details style={{ padding: '0 8px 8px' }}>
+          <summary style={{ fontSize: '10px', color: 'var(--dsw-alias-label-quaternary)', cursor: 'pointer' }}>
+            {t('chatOutput')}
+          </summary>
+          <pre
+            style={{
+              margin: '4px 0 0',
+              padding: '6px',
+              maxHeight: '200px',
+              overflow: 'auto',
+              borderRadius: '6px',
+              background: 'var(--dsw-alias-bg-layer-3)',
+              fontFamily: MONO,
+              fontSize: '10px',
+              lineHeight: '15px',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-all',
+              color: 'var(--dsw-alias-label-secondary)',
+            }}
+          >
+            {call.output}
+          </pre>
+        </details>
+      ) : null}
     </div>
   );
 }
 
 /**
- * 会话上下文卡（右栏当前内容）。
- * @param {{sid: string|null, entry: {status: string, data: object|null}|null, sessions: Record<string, object>, hosts: object[]}} props 组件参数。
- * @returns {JSX.Element} 上下文卡。
+ * 一个 assistant 回合：流式文本 + 若干命令卡。
+ * @param {{sid: string, message: object}} props 参数。
+ * @returns {JSX.Element} 回合块。
  */
-function ContextCard({ sid, entry, sessions, hosts }) {
-  useEffect(() => {
-    // 切标签就换一份上下文；已缓存（ready）时 store 内部直接返回，不重复请求。
-    void actions.loadContext(sid);
-  }, [sid]);
-
-  if (sid === null) {
-    return (
-      <div style={{ padding: '24px 16px' }}>
-        <div style={{ fontSize: '13px', lineHeight: '20px', color: 'var(--dsw-alias-label-secondary)' }}>{t('noSession')}</div>
-        <div style={{ marginTop: '8px', fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-quaternary)' }}>
-          {t('noSessionHint')}
-        </div>
-      </div>
-    );
+function TurnMessage({ sid, message }) {
+  const hasText = typeof message.text === 'string' && message.text !== '';
+  const calls = Array.isArray(message.calls) ? message.calls : [];
+  if (!hasText && calls.length === 0 && message.streaming === true) {
+    return <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatThinking')}</div>;
   }
-
-  const data = entry?.data ?? null;
-  const status = data?.status ?? sessions?.[sid]?.status ?? 'offline';
-  const label =
-    (typeof data?.host === 'string' ? data.host : data?.host?.label) ??
-    sessions?.[sid]?.host?.label ??
-    hosts.find((host) => host.sid === sid)?.label ??
-    sid;
-  const gap = data?.gap ?? null;
-  // 「回放缺口」警示灯的判据（Host 侧语义，别想当然）：
-  // Host 的 `gap.truncated` 有**两种**成因 —— ① 滚动缓冲真的被裁剪过
-  // （`dropped > 0`），② 缓冲总行数 > 本次请求的 lines（默认 80）。
-  // 我们只请求 80 行、只渲染 12 行，所以只要输出超过 80 行 `truncated` 就是
-  // true；拿它当警示灯会长期误亮。真正的"你少看了一段"只有 dropped > 0。
-  const dropped = typeof gap?.dropped === 'number' ? gap.dropped : 0;
-  const hasGap = gap?.truncated === true && dropped > 0;
-  const lines = toLines(data?.tail).slice(-TAIL_LINES);
-  // 首帧 entry 还不存在（effect 尚未跑完）算 loading，不要闪一下「暂无上下文」。
-  const loading = entry === null || entry === undefined || entry.status === 'loading';
-  const unavailable = entry?.status === 'unavailable';
-  const suggestions = [t('suggestion1'), t('suggestion2'), t('suggestion3')];
-
-  const handleCopy = (text) => {
-    void copyText(text).then((ok) => {
-      if (ok) actions.showToast(t('copied'));
-    });
-  };
-
   return (
-    <div style={{ padding: '12px 12px 20px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <span
-          aria-hidden="true"
-          style={{
-            width: '8px',
-            height: '8px',
-            flex: '0 0 auto',
-            borderRadius: '50%',
-            background: LIGHT_COLORS[status] ?? LIGHT_COLORS.offline,
-          }}
-        />
-        <span
-          style={{
-            flex: '1 1 auto',
-            minWidth: 0,
-            fontSize: '13px',
-            lineHeight: '18px',
-            fontWeight: 600,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {label}
-        </span>
-        <span style={{ flex: '0 0 auto', fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)' }}>
-          {t(STATUS_KEYS[status] ?? 'statusOffline')}
-        </span>
-      </div>
-      <div style={{ marginTop: '4px', fontSize: '11px', lineHeight: '16px', color: 'var(--dsw-alias-label-quaternary)' }}>
-        {t('contextSubtitle')}
-      </div>
-
-      {hasGap ? (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+      <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatAssistant')}</div>
+      {hasText ? (
         <div
           style={{
-            marginTop: '8px',
-            padding: '4px 8px',
+            fontSize: '12px',
+            lineHeight: '19px',
+            color: 'var(--dsw-alias-label-primary)',
+            wordBreak: 'break-word',
+          }}
+        >
+          <RichText text={message.text} />
+        </div>
+      ) : null}
+      {calls.map((call) => (
+        <CallCard key={call.id} sid={sid} call={call} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * 消息列表：user 气泡 + assistant 回合 + 错误条。
+ * @param {{sid: string}} props 参数。
+ * @returns {JSX.Element} 消息列表。
+ */
+function ChatMessages({ sid }) {
+  const chat = getState().chats[sid] ?? { messages: [], streaming: false, error: null };
+  const bottomRef = useRef(null);
+
+  useEffect(() => {
+    // 新消息/流式增量到底部：对话面板的基本礼貌。
+    bottomRef.current?.scrollIntoView({ block: 'end' });
+  }, [chat.messages, chat.streaming]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', padding: '12px' }}>
+      {chat.messages.length === 0 && chat.streaming !== true ? (
+        <div style={{ padding: '12px 4px' }}>
+          <div style={{ fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-secondary)' }}>{t('chatSubtitle')}</div>
+          <div style={{ marginTop: '10px', fontSize: '10px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatSuggestHint')}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '6px' }}>
+            {[t('suggestion1'), t('suggestion2'), t('suggestion3')].map((text, index) => (
+              <button
+                key={`suggest-${index}`}
+                type="button"
+                onClick={() => void actions.sendChat(text)}
+                style={{
+                  display: 'block',
+                  width: '100%',
+                  textAlign: 'left',
+                  padding: '7px 9px',
+                  border: '0.5px solid var(--dsw-alias-border-l2)',
+                  borderRadius: '7px',
+                  cursor: 'pointer',
+                  font: 'inherit',
+                  fontSize: '11px',
+                  lineHeight: '16px',
+                  color: 'var(--dsw-alias-label-secondary)',
+                  background: 'var(--dsw-alias-bg-layer-2)',
+                }}
+              >
+                {text}
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {chat.messages.map((message, index) =>
+        message.role === 'user' ? (
+          <div key={`m${index}`} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px' }}>
+            <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatYou')}</div>
+            <div
+              style={{
+                maxWidth: '92%',
+                padding: '7px 10px',
+                borderRadius: '10px',
+                fontSize: '12px',
+                lineHeight: '18px',
+                color: 'var(--dsw-alias-label-primary)',
+                background: 'var(--dsw-alias-bg-layer-3)',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {message.content}
+            </div>
+          </div>
+        ) : (
+          <TurnMessage key={`m${index}`} sid={sid} message={message} />
+        ),
+      )}
+      {chat.streaming === true && chat.messages.every((message) => message.kind !== 'turn' || message.streaming !== true) ? (
+        <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatThinking')}</div>
+      ) : null}
+      {chat.error !== null ? (
+        <div
+          style={{
+            padding: '6px 8px',
             borderRadius: '6px',
             fontSize: '11px',
             lineHeight: '16px',
@@ -240,119 +375,206 @@ function ContextCard({ sid, entry, sessions, hosts }) {
             background: 'var(--dsw-alias-bg-layer-3)',
           }}
         >
-          {t('contextGap')}
-          {typeof gap?.dropped === 'number' ? ` · -${gap.dropped}` : ''}
+          {t('chatError', { message: chat.error })}
         </div>
       ) : null}
+      <div ref={bottomRef} />
+    </div>
+  );
+}
 
-      <SectionTitle
-        title={t('contextTail')}
-        action={
-          <button
-            type="button"
-            onClick={() => void actions.refreshContext(sid)}
-            style={{
-              padding: '2px 6px',
-              border: '0.5px solid var(--dsw-alias-border-l2)',
-              borderRadius: '5px',
-              cursor: 'pointer',
-              font: 'inherit',
-              fontSize: '10px',
-              fontWeight: 400,
-              color: 'var(--dsw-alias-label-tertiary)',
-              background: 'transparent',
-            }}
-          >
-            {t('contextRefresh')}
-          </button>
-        }
+/**
+ * 输入区：textarea（Enter 发送 / Shift+Enter 换行）+ 发送/停止按钮。
+ * @param {{sid: string, streaming: boolean}} props 参数。
+ * @returns {JSX.Element} 输入区。
+ */
+function ChatComposer({ sid, streaming }) {
+  const [draft, setDraft] = React.useState('');
+  /**
+   * 发送当前草稿。
+   * @returns {void}
+   */
+  const submit = () => {
+    const text = draft.trim();
+    if (text === '' || streaming === true) return;
+    setDraft('');
+    void actions.sendChat(text);
+  };
+  return (
+    <div style={{ borderTop: '0.5px solid var(--dsw-alias-border-l2)', padding: '8px' }}>
+      <textarea
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          // Enter 发送、Shift+Enter 换行——输入框的通行约定。
+          if (event.key === 'Enter' && event.shiftKey !== true) {
+            event.preventDefault();
+            submit();
+          }
+        }}
+        placeholder={t('chatPlaceholder')}
+        rows={3}
+        style={{
+          width: '100%',
+          boxSizing: 'border-box',
+          padding: '7px 9px',
+          border: '0.5px solid var(--dsw-alias-border-l2)',
+          borderRadius: '8px',
+          resize: 'none',
+          font: 'inherit',
+          fontSize: '12px',
+          lineHeight: '18px',
+          color: 'var(--dsw-alias-label-primary)',
+          background: 'var(--dsw-alias-bg-layer-2)',
+        }}
       />
-
-      {unavailable ? (
-        <div>
-          <div style={{ fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-secondary)' }}>{t('contextUnavailable')}</div>
-          <div style={{ marginTop: '4px', fontSize: '11px', lineHeight: '16px', color: 'var(--dsw-alias-label-quaternary)' }}>
-            {t('contextUnavailableHint')}
-          </div>
-        </div>
-      ) : loading && lines.length === 0 ? (
-        <div style={{ fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('loading')}</div>
-      ) : lines.length === 0 ? (
-        <div style={{ fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('contextEmpty')}</div>
-      ) : (
-        <pre
-          style={{
-            margin: 0,
-            padding: '8px',
-            maxHeight: '220px',
-            overflow: 'auto',
-            borderRadius: '6px',
-            border: '0.5px solid var(--dsw-alias-border-l2)',
-            background: 'var(--dsw-alias-bg-layer-2)',
-            color: 'var(--dsw-alias-label-secondary)',
-            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-            fontSize: '11px',
-            lineHeight: '16px',
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-all',
-          }}
-        >
-          {lines.join('\n')}
-        </pre>
-      )}
-
-      <SectionTitle title={t('contextSuggestions')} />
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-        {suggestions.map((text, index) => (
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '6px', marginTop: '6px' }}>
+        {streaming === true ? (
           <button
-            key={`suggestion-${index + 1}`}
             type="button"
-            title={`${t('copied')} ← ${text}`}
-            onClick={() => handleCopy(text)}
+            onClick={actions.stopChat}
             style={{
-              display: 'block',
-              width: '100%',
-              textAlign: 'left',
-              padding: '7px 9px',
+              padding: '5px 14px',
               border: '0.5px solid var(--dsw-alias-border-l2)',
               borderRadius: '7px',
               cursor: 'pointer',
               font: 'inherit',
               fontSize: '11px',
-              lineHeight: '16px',
-              color: 'var(--dsw-alias-label-secondary)',
-              background: 'var(--dsw-alias-bg-layer-2)',
+              color: 'var(--dsw-alias-label-tertiary)',
+              background: 'transparent',
             }}
           >
-            {text}
+            {t('chatStop')}
           </button>
-        ))}
+        ) : null}
+        <button
+          type="button"
+          onClick={submit}
+          disabled={streaming === true || draft.trim() === ''}
+          style={{
+            padding: '5px 16px',
+            border: '0.5px solid var(--dsw-alias-brand-primary)',
+            borderRadius: '7px',
+            cursor: streaming === true || draft.trim() === '' ? 'default' : 'pointer',
+            font: 'inherit',
+            fontSize: '11px',
+            color: 'var(--dsw-alias-brand-primary)',
+            background: 'transparent',
+            opacity: streaming === true || draft.trim() === '' ? 0.5 : 1,
+          }}
+        >
+          {t('chatSend')}
+        </button>
       </div>
     </div>
   );
 }
 
 /**
- * 右栏面板。
+ * 模型选择 + 自动执行开关（输入区上方一行）。
+ * @returns {JSX.Element} 控制行。
+ */
+function ChatControls() {
+  const llm = getState().llm;
+  const autoExec = getState().chatAutoExec;
+  if (llm.status !== 'ready') return null;
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 12px', borderBottom: '0.5px solid var(--dsw-alias-border-l2)' }}>
+      <span style={{ flex: '0 0 auto', fontSize: '10px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatModel')}</span>
+      <select
+        value={`${llm.picked.provider}::${llm.picked.model}`}
+        onChange={(event) => {
+          const [provider, ...rest] = event.target.value.split('::');
+          actions.setChatModel(provider, rest.join('::'));
+        }}
+        style={{
+          flex: '1 1 auto',
+          minWidth: 0,
+          padding: '3px 6px',
+          border: '0.5px solid var(--dsw-alias-border-l2)',
+          borderRadius: '6px',
+          font: 'inherit',
+          fontSize: '10px',
+          color: 'var(--dsw-alias-label-secondary)',
+          background: 'var(--dsw-alias-bg-layer-2)',
+        }}
+      >
+        {llm.providers.map((provider) => (
+          <optgroup key={provider.id} label={provider.name}>
+            {(provider.models ?? []).map((model) => (
+              <option key={`${provider.id}::${model.id}`} value={`${provider.id}::${model.id}`}>
+                {model.label !== '' ? model.label : model.id}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+      <button
+        type="button"
+        onClick={actions.toggleAutoExec}
+        title={autoExec === true ? t('chatAutoExecOn') : t('chatAutoExecOff')}
+        style={{
+          flex: '0 0 auto',
+          padding: '3px 8px',
+          border: `0.5px solid ${autoExec === true ? 'var(--dsw-alias-label-error)' : 'var(--dsw-alias-border-l2)'}`,
+          borderRadius: '6px',
+          cursor: 'pointer',
+          font: 'inherit',
+          fontSize: '10px',
+          color: autoExec === true ? 'var(--dsw-alias-label-error)' : 'var(--dsw-alias-label-tertiary)',
+          background: 'transparent',
+        }}
+      >
+        {t('chatAutoExec')}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * 右栏面板：模型控制 + 消息列表 + 输入区。
  * @returns {JSX.Element} 右栏。
  */
 export function ChatPane() {
   const state = useSyncExternalStore(subscribe, getState);
   const sid = state.activeSid;
 
+  useEffect(() => {
+    // 模型清单与开关偏好各拉一次：右栏挂载就要知道"能不能聊"。
+    void actions.loadLlm();
+    actions.restoreChatPrefs();
+  }, []);
+
+  const chat = sid === null ? null : (state.chats[sid] ?? { messages: [], streaming: false, error: null });
+  const llmUnavailable = state.llm.status === 'unavailable';
+
   /**
-   * **唯一替换点**：将来换成 `renderFactorySlot('conversation.content', ...)`
-   * 的那一行（见文件头注释）。除此之外右栏没有任何与对话内容耦合的代码。
-   * @returns {JSX.Element} 对话区内容。
+   *  body 区：没会话 / 没模型 / 正常对话 三态。
+   * @returns {JSX.Element} 内容。
    */
-  const renderConversation = () => (
-    <ContextCard
-      sid={sid}
-      entry={sid === null ? null : (state.contexts[sid] ?? null)}
-      sessions={state.sessions}
-      hosts={state.hosts}
-    />
-  );
+  const renderBody = () => {
+    if (sid === null) {
+      return (
+        <div style={{ padding: '24px 16px' }}>
+          <div style={{ fontSize: '13px', lineHeight: '20px', color: 'var(--dsw-alias-label-secondary)' }}>{t('noSession')}</div>
+          <div style={{ marginTop: '8px', fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-quaternary)' }}>
+            {t('chatNoSessionHint')}
+          </div>
+        </div>
+      );
+    }
+    if (llmUnavailable === true) {
+      return (
+        <div style={{ padding: '24px 16px' }}>
+          <div style={{ fontSize: '13px', lineHeight: '20px', color: 'var(--dsw-alias-label-secondary)' }}>{t('chatNoLlm')}</div>
+          <div style={{ marginTop: '8px', fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-quaternary)' }}>
+            {t('chatNoLlmHint')}
+          </div>
+        </div>
+      );
+    }
+    return <ChatMessages sid={sid} />;
+  };
 
   return (
     <aside
@@ -368,12 +590,16 @@ export function ChatPane() {
     >
       <div style={headerStyle}>
         <ChatIcon size={14} />
-        <span style={{ flex: '1 1 auto' }}>{t('contextTitle')}</span>
+        <span style={{ flex: '1 1 auto' }}>{t('chatTitle')}</span>
         <button type="button" style={iconButtonStyle} onClick={actions.toggleChat} title={t('collapse')} aria-label={t('collapse')}>
           <ChevronRightIcon size={14} />
         </button>
       </div>
-      <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>{renderConversation()}</div>
+      <ChatControls />
+      <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>{renderBody()}</div>
+      {sid !== null && llmUnavailable !== true ? (
+        <ChatComposer sid={sid} streaming={chat?.streaming === true} />
+      ) : null}
     </aside>
   );
 }

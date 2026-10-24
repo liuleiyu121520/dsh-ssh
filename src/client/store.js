@@ -57,6 +57,22 @@ let state = {
    * Host 侧 /context 还没就位时一律 'unavailable'，UI 优雅降级不崩。
    */
   contexts: {},
+  /**
+   * sid -> 对话状态（AI 助手）。
+   * `{messages: object[], streaming: boolean, error: string|null}`；
+   * messages 是视图模型：user 消息 `{role, content}`，assistant 回合
+   * `{role:'assistant', kind:'turn', text, calls:[...]}`（calls 即命令卡）。
+   * 模块级存活，切标签不丢（与 runtimes 同一保活哲学）。
+   * @type {Record<string, object>}
+   */
+  chats: {},
+  /**
+   * 模型服务状态：`{status: 'idle'|'ready'|'unavailable', providers: object[], picked: {provider, model}}`。
+   * @type {object}
+   */
+  llm: { status: 'idle', providers: [], picked: { provider: '', model: '' } },
+  /** 自动执行开关（命令不经确认直接跑）；持久化在 localStorage。 */
+  chatAutoExec: false,
 };
 
 /** @type {Set<() => void>} */
@@ -260,6 +276,279 @@ function terminalTheme() {
 
 /** @type {Map<string, object>} sid -> 运行时（xterm + DOM wrapper + SSE）。 */
 const runtimes = new Map();
+
+// ── AI 助手：对话状态机（视图模型 ↔ llm history 双向映射） ──────────────
+//
+// 视图模型（state.chats[sid].messages）：
+//   user      {role:'user', content: string}
+//   assistant {role:'assistant', kind:'turn', text, calls: [call], streaming?}
+//     call = {id, name, command, arguments, status, ok, output, timedOut,
+//             resultContent?, resultError?}
+//       status: 'awaiting'（等用户确认）| 'running' | 'done' | 'failed'
+//               | 'skipped'
+// llm history（POST /chat 的 messages）由 buildChatHistory 推导：assistant
+// 回合拆成"文本块 + tool-call 块"的一条消息，每个有 resultContent 的 call
+// 跟一条 {role:'tool'} 结果消息。
+
+/** localStorage 键：模型选择与自动执行开关。 */
+const LS_MODEL = 'dsh-ssh:chatModel';
+const LS_AUTO_EXEC = 'dsh-ssh:chatAutoExec';
+
+/** 进行中的对话请求的 AbortController（"停止"按钮用）。 */
+let chatAbort = null;
+
+/**
+ * 取（或懒建）一个会话的对话状态。
+ * @param {string} sid 会话 id。
+ * @returns {object} 对话状态。
+ */
+function chatOf(sid) {
+  return state.chats[sid] ?? { messages: [], streaming: false, error: null };
+}
+
+/**
+ * 合并补丁到某个会话的对话状态并广播。
+ * @param {string} sid 会话 id。
+ * @param {object} patch 补丁。
+ * @returns {void}
+ */
+function patchChat(sid, patch) {
+  const next = { ...chatOf(sid), ...patch };
+  setState({ chats: { ...state.chats, [sid]: next } });
+}
+
+/**
+ * 往某个会话的对话里追加一条消息。
+ * @param {string} sid 会话 id。
+ * @param {object} message 消息（视图模型）。
+ * @returns {void}
+ */
+function appendChatMessage(sid, message) {
+  patchChat(sid, { messages: [...chatOf(sid).messages, message] });
+}
+
+/**
+ * 把流式文本增量并进"当前回合"（没有就新建一个）。
+ * @param {string} sid 会话 id。
+ * @param {string} text 增量文本。
+ * @returns {void}
+ */
+function appendTurnText(sid, text) {
+  const messages = chatOf(sid).messages.slice();
+  const last = messages[messages.length - 1];
+  if (last !== undefined && last.kind === 'turn' && last.streaming === true) {
+    messages[messages.length - 1] = { ...last, text: last.text + text };
+  } else {
+    messages.push({ role: 'assistant', kind: 'turn', text, calls: [], streaming: true });
+  }
+  patchChat(sid, { messages });
+}
+
+/**
+ * 给当前回合追加一个工具调用卡片。
+ * @param {string} sid 会话 id。
+ * @param {object} call 工具调用（{id, name, command, arguments}）。
+ * @returns {void}
+ */
+function appendTurnCall(sid, call) {
+  const messages = chatOf(sid).messages.slice();
+  const last = messages[messages.length - 1];
+  const card = {
+    id: call.id,
+    name: call.name,
+    command: call.command,
+    arguments: call.arguments,
+    status: state.chatAutoExec === true ? 'running' : 'awaiting',
+    ok: null,
+    output: '',
+    timedOut: false,
+  };
+  if (last !== undefined && last.kind === 'turn' && last.streaming === true) {
+    messages[messages.length - 1] = { ...last, calls: [...last.calls, card] };
+  } else {
+    messages.push({ role: 'assistant', kind: 'turn', text: '', calls: [card], streaming: true });
+  }
+  patchChat(sid, { messages });
+}
+
+/**
+ * 按 id 找到某个 call 并打补丁。
+ * @param {string} sid 会话 id。
+ * @param {string} callId 工具调用 id。
+ * @param {object} patch 补丁。
+ * @returns {void}
+ */
+function patchCall(sid, callId, patch) {
+  const messages = chatOf(sid).messages.slice();
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.kind !== 'turn') continue;
+    const callIndex = (message.calls ?? []).findIndex((call) => call.id === callId);
+    if (callIndex === -1) continue;
+    const calls = message.calls.slice();
+    calls[callIndex] = { ...calls[callIndex], ...patch };
+    messages[index] = { ...message, calls };
+    patchChat(sid, { messages });
+    return;
+  }
+}
+
+/**
+ * 把视图模型推导成 llm history。
+ * @param {object[]} messages 视图模型消息。
+ * @returns {object[]} llm history。
+ */
+function buildChatHistory(messages) {
+  /** @type {object[]} */
+  const history = [];
+  for (const message of messages) {
+    if (message.role === 'user') {
+      history.push({ role: 'user', content: String(message.content ?? '') });
+      continue;
+    }
+    if (message.kind !== 'turn') continue;
+    /** @type {object[]} */
+    const blocks = [];
+    if (typeof message.text === 'string' && message.text !== '') {
+      blocks.push({ type: 'text', text: message.text });
+    }
+    for (const call of message.calls ?? []) {
+      blocks.push({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments });
+    }
+    if (blocks.length > 0) history.push({ role: 'assistant', content: blocks });
+    for (const call of message.calls ?? []) {
+      if (call.resultContent === undefined) continue;
+      history.push({
+        role: 'tool',
+        toolCallId: call.id,
+        content: call.resultContent,
+        isError: call.resultError === true,
+      });
+    }
+  }
+  return history;
+}
+
+/**
+ * 读 SSE 流（fetch + ReadableStream；POST 没有 EventSource）。
+ * @param {object} response fetch 响应。
+ * @param {(event: object) => void} onEvent 事件回调。
+ * @returns {Promise<void>}
+ */
+async function readChatStream(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let index = buffer.indexOf('\n\n');
+    while (index >= 0) {
+      const frame = buffer.slice(0, index);
+      buffer = buffer.slice(index + 2);
+      // `data: ` 开头的才是事件帧；`: ping` / 注释直接忽略。
+      if (frame.startsWith('data: ')) {
+        try {
+          onEvent(JSON.parse(frame.slice(6)));
+        } catch {
+          // 半包 JSON：丢，下一帧会带上完整状态。
+        }
+      }
+      index = buffer.indexOf('\n\n');
+    }
+  }
+}
+
+/**
+ * 处理一个对话事件（流式增量落进视图模型）。
+ * @param {string} sid 会话 id。
+ * @param {object} event 事件。
+ * @returns {void}
+ */
+function handleChatEvent(sid, event) {
+  if (event?.type === 'model') {
+    setState({ llm: { ...state.llm, picked: { provider: event.provider, model: event.model } } });
+    return;
+  }
+  if (event?.type === 'text' && typeof event.text === 'string') {
+    appendTurnText(sid, event.text);
+    return;
+  }
+  if (event?.type === 'tool-call') {
+    appendTurnCall(sid, event);
+    return;
+  }
+  if (event?.type === 'tool-result') {
+    patchCall(sid, event.id, {
+      status: event.ok === true ? 'done' : 'failed',
+      ok: event.ok === true,
+      output: typeof event.output === 'string' ? event.output : '',
+      timedOut: event.timedOut === true,
+    });
+    return;
+  }
+  if (event?.type === 'error') {
+    patchChat(sid, { streaming: false, error: typeof event.message === 'string' ? event.message : 'unknown error' });
+    return;
+  }
+  if (event?.type === 'finish') {
+    // tool-call = 人工确认模式下回合暂停，等用户逐条执行/跳过后续跑。
+    // 其余 reason（stop / max-rounds / aborted）= 回合结束。
+    const messages = chatOf(sid).messages.slice();
+    const last = messages[messages.length - 1];
+    if (last !== undefined && last.kind === 'turn' && last.streaming === true) {
+      messages[messages.length - 1] = { ...last, streaming: false };
+      patchChat(sid, { messages, streaming: event.reason === 'tool-call' });
+    } else {
+      patchChat(sid, { streaming: event.reason === 'tool-call' });
+    }
+  }
+}
+
+/**
+ * 跑一个对话回合：POST /chat 收 SSE，事件落进 state.chats[sid]。
+ * @param {string} sid 会话 id。
+ * @returns {Promise<void>}
+ */
+async function runChatTurn(sid) {
+  const current = chatOf(sid);
+  if (chatAbort !== null) return; // 同一会话只允许一个在途回合
+  chatAbort = new AbortController();
+  patchChat(sid, { streaming: true, error: null });
+  try {
+    const response = await fetch(`${API}/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+      body: JSON.stringify({
+        sid,
+        messages: buildChatHistory(current.messages),
+        autoExecute: state.chatAutoExec === true,
+        provider: state.llm.picked.provider,
+        model: state.llm.picked.model,
+      }),
+      signal: chatAbort.signal,
+    });
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const data = await response.json();
+        if (typeof data?.error === 'string') message = data.error;
+      } catch {
+        // 非 JSON 错误体：用状态码。
+      }
+      patchChat(sid, { streaming: false, error: message });
+      return;
+    }
+    await readChatStream(response, (event) => handleChatEvent(sid, event));
+    patchChat(sid, { streaming: false });
+  } catch (error) {
+    // AbortError 是用户点"停止"：静默收尾，不当成错误展示。
+    patchChat(sid, { streaming: false, error: error?.name === 'AbortError' ? null : (error?.message ?? String(error)) });
+  } finally {
+    chatAbort = null;
+  }
+}
 
 /** toast 自动消失的定时器句柄。 */
 let toastTimer = null;
@@ -829,6 +1118,173 @@ export const actions = {
    */
   async refreshContext(sid) {
     await actions.loadContext(sid, { force: true });
+  },
+
+  /**
+   * 拉模型清单（右栏下拉 + "未配置模型"降级判断）。
+   *
+   * picked 的恢复顺序：localStorage 里的旧选择（仍在清单里才用）→ patch
+   * 配置的默认（Host 下发）→ 第一个有模型的 provider 的第一个模型。
+   * @returns {Promise<void>}
+   */
+  async loadLlm() {
+    try {
+      const data = await actions._get('/llm');
+      if (data?.available !== true) {
+        setState({ llm: { status: 'unavailable', providers: [], picked: { provider: '', model: '' } } });
+        return;
+      }
+      const providers = Array.isArray(data.providers) ? data.providers : [];
+      let picked = { provider: '', model: '' };
+      try {
+        const saved = JSON.parse(localStorage.getItem(LS_MODEL) ?? 'null');
+        if (saved !== null && typeof saved === 'object') picked = { provider: String(saved.provider ?? ''), model: String(saved.model ?? '') };
+      } catch {
+        // localStorage 不可用/脏数据：按默认走。
+      }
+      const known = providers.find((row) => row.id === picked.provider);
+      if (known === undefined || !(known.models ?? []).some((model) => model.id === picked.model)) {
+        const configured = providers.find((row) => row.id === data.default?.provider);
+        const fromConfig = configured?.models?.find((model) => model.id === data.default?.model) ?? configured?.models?.[0] ?? null;
+        picked = fromConfig !== null && configured !== undefined
+          ? { provider: configured.id, model: fromConfig.id }
+          : { provider: providers[0]?.id ?? '', model: providers[0]?.models?.[0]?.id ?? '' };
+      }
+      setState({ llm: { status: 'ready', providers, picked } });
+    } catch {
+      setState({ llm: { status: 'unavailable', providers: [], picked: { provider: '', model: '' } } });
+    }
+  },
+
+  /**
+   * 切换模型（右栏下拉）。选择持久化到 localStorage。
+   * @param {string} provider provider id。
+   * @param {string} model model id。
+   * @returns {void}
+   */
+  setChatModel(provider, model) {
+    setState({ llm: { ...state.llm, picked: { provider, model } } });
+    try {
+      localStorage.setItem(LS_MODEL, JSON.stringify({ provider, model }));
+    } catch {
+      // 隐私模式下 localStorage 会抛：不影响当次选择。
+    }
+  },
+
+  /**
+   * 自动执行开关。持久化到 localStorage；关 = 每条命令等用户点"执行"。
+   * @returns {void}
+   */
+  toggleAutoExec() {
+    const next = state.chatAutoExec !== true;
+    setState({ chatAutoExec: next });
+    try {
+      localStorage.setItem(LS_AUTO_EXEC, next ? '1' : '0');
+    } catch {
+      // 忽略：开关当场生效，重启后回默认。
+    }
+  },
+
+  /**
+   * 从 localStorage 恢复自动执行开关（view 挂载时调一次）。
+   * @returns {void}
+   */
+  restoreChatPrefs() {
+    try {
+      if (localStorage.getItem(LS_AUTO_EXEC) === '1') setState({ chatAutoExec: true });
+    } catch {
+      // 忽略。
+    }
+  },
+
+  /**
+   * 发一条大白话（当前会话）。流式渲染由 runChatTurn 负责。
+   * @param {string} text 用户输入。
+   * @returns {Promise<void>}
+   */
+  async sendChat(text) {
+    const sid = state.activeSid;
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    if (sid === null || trimmed === '') return;
+    if (chatOf(sid).streaming === true) return;
+    appendChatMessage(sid, { role: 'user', content: trimmed });
+    await runChatTurn(sid);
+  },
+
+  /**
+   * 人工确认模式下，用户对某条命令点"执行/跳过"。
+   *
+   * 执行走 `POST /chat/exec`（Host 侧 marker 捕获，与自动执行同一份实现）；
+   * 跳过则回一条 isError 的 tool 结果，让模型知道"用户不跑"。
+   * 一个回合里的命令全部有归属后，自动续跑对话。
+   * @param {string} sid 会话 id。
+   * @param {string} callId 工具调用 id。
+   * @param {boolean} run true=执行，false=跳过。
+   * @returns {Promise<void>}
+   */
+  async resolveToolCall(sid, callId, run) {
+    const chat = chatOf(sid);
+    if (chat.streaming === true) return;
+    /** @type {object|null} */
+    let target = null;
+    for (const message of chat.messages) {
+      if (message.kind !== 'turn') continue;
+      const call = (message.calls ?? []).find((item) => item.id === callId);
+      if (call !== undefined) { target = call; break; }
+    }
+    if (target === null || target.status !== 'awaiting') return;
+
+    if (run !== true) {
+      patchCall(sid, callId, {
+        status: 'skipped',
+        ok: null,
+        resultContent: t('chatUserSkipped'),
+        resultError: true,
+      });
+    } else {
+      patchCall(sid, callId, { status: 'running' });
+      try {
+        const outcome = await actions._request('POST', '/chat/exec', {
+          sid,
+          command: target.command,
+        });
+        patchCall(sid, callId, {
+          status: outcome?.ok === true ? 'done' : 'failed',
+          ok: outcome?.ok === true,
+          output: typeof outcome?.output === 'string' ? outcome.output : '',
+          timedOut: outcome?.timedOut === true,
+          resultContent: typeof outcome?.output === 'string' ? outcome.output : '',
+          resultError: outcome?.ok !== true,
+        });
+      } catch (error) {
+        patchCall(sid, callId, {
+          status: 'failed',
+          ok: false,
+          output: describeError(error),
+          resultContent: describeError(error),
+          resultError: true,
+        });
+      }
+    }
+
+    // 全部命令都有归属后续跑，否则等用户把剩下的点完。
+    const messages = chatOf(sid).messages;
+    let pending = false;
+    for (const message of messages) {
+      if (message.kind !== 'turn') continue;
+      for (const call of message.calls ?? []) {
+        if (call.resultContent === undefined) pending = true;
+      }
+    }
+    if (pending !== true) await runChatTurn(sid);
+  },
+
+  /**
+   * 停止当前回合（中断 SSE；Host 侧 AbortSignal 会让模型轮收尾）。
+   * @returns {void}
+   */
+  stopChat() {
+    if (chatAbort !== null) chatAbort.abort();
   },
 
   /**

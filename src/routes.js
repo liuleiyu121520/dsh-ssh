@@ -247,15 +247,6 @@ async function handleStream(ctx, service, req, res) {
   const replay = service.read(sid, from);
   const session = service.get(sid);
 
-  /** 写帧的安全版：连接半死时 write 会同步抛，定时器里抛异常会带走进程。 */
-  const safeWrite = (target, text) => {
-    try {
-      if (!target.writableEnded && !target.destroyed) target.write(text);
-    } catch {
-      // 连接已断：teardown 会随后跑到，这里静默。
-    }
-  };
-
   const unsubscribe = service.subscribe(sid, (event) => {
     if (event.kind === 'data') {
       safeWrite(res, formatSseFrame({ seq: event.seq, data: event.data }));
@@ -316,6 +307,79 @@ async function handleStream(ctx, service, req, res) {
 }
 
 /**
+ * 写帧的安全版：连接半死时 write 会同步抛，定时器里抛异常会带走进程。
+ * @param {object} target res。
+ * @param {string} text 帧文本。
+ * @returns {void}
+ */
+function safeWrite(target, text) {
+  try {
+    if (!target.writableEnded && !target.destroyed) target.write(text);
+  } catch {
+    // 连接已断：teardown 会随后跑到，这里静默。
+  }
+}
+
+/**
+ * 把一个对话事件格式化成 SSE 帧。
+ * @param {object} event chat 事件（{type, ...}）。
+ * @returns {string} `data: {...}\n\n`。
+ */
+export function formatChatFrame(event) {
+  return `data: ${JSON.stringify(event)}\n\n`;
+}
+
+/**
+ * POST /api/dsh-ssh/chat —— 对话回合（SSE 事件流）。
+ *
+ * 事件序列：`model`（选中的 provider/model）→ `text`（增量，可多条）→
+ * `tool-call`（待执行/已执行）→ `tool-result` → … → `finish`；
+ * 出错是 `error` 帧不断流。finish.reason='tool-call' 表示人工确认模式下
+ * 回合暂停，客户端执行后带 tool 结果再次 POST 续跑。
+ * @param {() => object|null} getChat 取对话服务（llm 缺失时为 null）。
+ * @param {object} req 请求。
+ * @param {object} res 响应。
+ * @returns {Promise<void>}
+ */
+async function handleChat(getChat, req, res) {
+  const chat = getChat();
+  if (chat === null || chat === undefined) {
+    throw new HttpError(501, 'chat service unavailable: host llm service is missing', 'chat-unavailable');
+  }
+  const body = await readJsonBody(req);
+  const sid = requireSid(body.sid);
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+
+  const controller = new AbortController();
+  const onClose = () => controller.abort();
+  res.on('close', onClose);
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-store',
+    connection: 'keep-alive',
+  });
+  // 首帧注释：立刻冲开管道，客户端可据此判定"连上了"。
+  safeWrite(res, ': dsh-ssh chat open\n\n');
+  // 心跳：模型思考与命令执行都可能有十几秒空窗，防代理掐空闲连接。
+  const ping = setInterval(() => safeWrite(res, ': ping\n\n'), PING_INTERVAL_MS);
+  try {
+    await chat.runTurn({
+      sid,
+      messages,
+      autoExecute: body.autoExecute === true,
+      provider: typeof body.provider === 'string' ? body.provider : '',
+      model: typeof body.model === 'string' ? body.model : '',
+      signal: controller.signal,
+      onEvent: (event) => safeWrite(res, formatChatFrame(event)),
+    });
+  } finally {
+    clearInterval(ping);
+    res.off('close', onClose);
+    if (!res.writableEnded) res.end();
+  }
+}
+
+/**
  * 注册全部 `/api/dsh-ssh/*` 路由。
  *
  * 每条路由一个 ctx.effect：插件停用时 webServer 的 disposer 自动跑掉，
@@ -339,6 +403,12 @@ export function registerRoutes(ctx, options = {}) {
    */
   const getStore = () =>
     (typeof options.store === 'function' ? options.store() : options.store ?? null);
+  /**
+   * 取当前的对话服务（llm 分层 inject 晚到；缺失时为 null）。
+   * @returns {object|null} chat 服务或 null。
+   */
+  const getChat = () =>
+    (typeof options.chat === 'function' ? options.chat() : options.chat ?? null);
 
   /**
    * 取 store，没有就抛 `storage-unavailable`（501）。
@@ -532,5 +602,45 @@ export function registerRoutes(ctx, options = {}) {
       tail: tail.text,
       gap: { truncated: tail.truncated, dropped: tail.dropped },
     });
+  });
+
+  // GET /api/dsh-ssh/llm —— 对话可用的模型清单（右栏下拉的数据源）。
+  register('exact', `${PREFIX}/llm`, async (req, res) => {
+    if (req.method !== 'GET') throw new HttpError(405, 'GET only');
+    const chat = getChat();
+    if (chat === null) {
+      // 没挂上 llm 服务也是可回答的状态：UI 显示"未配置模型"，不是错误。
+      sendJson(res, 200, { available: false, providers: [], default: { provider: '', model: '' }, reason: 'chat-unavailable' });
+      return;
+    }
+    sendJson(res, 200, await chat.describeModels());
+  });
+
+  // POST /api/dsh-ssh/chat —— 对话回合（SSE）。
+  register('exact', `${PREFIX}/chat`, async (req, res) => {
+    if (req.method !== 'POST') throw new HttpError(405, 'POST only');
+    await handleChat(getChat, req, res);
+  });
+
+  // POST /api/dsh-ssh/chat/exec —— 人工确认模式下执行一条命令并捕获输出。
+  // 与自动执行同一份 marker 捕获实现；结果由客户端拼进 history 续跑对话。
+  register('prefix', `${PREFIX}/chat`, async (req, res) => {
+    const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+    if (pathname !== `${PREFIX}/chat/exec`) throw new HttpError(404, 'unknown route');
+    if (req.method !== 'POST') throw new HttpError(405, 'POST only');
+    const chat = getChat();
+    if (chat === null) {
+      throw new HttpError(501, 'chat service unavailable: host llm service is missing', 'chat-unavailable');
+    }
+    const body = await readJsonBody(req);
+    const sid = requireSid(body.sid);
+    const command = typeof body.command === 'string' ? body.command.trim() : '';
+    if (command === '') throw new HttpError(400, 'command must be a non-empty string');
+    const outcome = await chat.executeInSession({
+      sid,
+      command,
+      timeoutMs: Number.isFinite(body.timeoutMs) && body.timeoutMs > 0 ? body.timeoutMs : undefined,
+    });
+    sendJson(res, 200, outcome);
   });
 }

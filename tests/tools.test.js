@@ -340,7 +340,8 @@ test('apply() also survives a missing storage layer', async () => {
   const dispose = await apply(ctx, {});
   await dispose.ready;
   assert.ok(ctx.routes.length >= 8);
-  assert.equal(ctx.skipped.length, 2, 'both optional halves were skipped');
+  // 三个可选半层（持久化 / 模型工具 / 对话）全部跳过，底座路由照常。
+  assert.equal(ctx.skipped.length, 3, 'all optional halves were skipped');
   await dispose();
 });
 

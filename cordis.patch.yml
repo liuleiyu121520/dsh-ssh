@@ -36,6 +36,14 @@
         # 允许上传/下载的本地根目录。留空 = process.cwd()；任何解析后跳出该
         # 目录的路径（含 ..）一律拒绝，错误码 path-outside-root。
         transferRoot: ''
+        # 右栏 AI 助手（对话 → 读面板 → 生成命令 → 执行）。
+        # provider/model 留空 = 运行时自动挑（宿主第一个有模型的 provider，
+        # 用户在右栏下拉里可切换，选择记在浏览器本地）。
+        chat:
+          provider: ''
+          model: ''
+          # 终端尾部进 system prompt 的行数（越大模型越有上下文，token 越多）。
+          maxContextLines: 60
         # 注：客户端的保活运行时上限是代码常量 `src/client/store.js` 的
         # MAX_KEPT_RUNTIMES（默认 8），不是配置项——Host 侧无法对客户端强制，
         # 所以这里不再放一个读了却不生效的开关。

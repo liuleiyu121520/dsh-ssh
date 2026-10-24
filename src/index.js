@@ -18,6 +18,7 @@ import { registerRoutes } from './routes.js';
 import { HostStore, seedHostsFromConfig } from './hosts.js';
 import { createVault } from './vault.js';
 import { createSshTools } from './tools.js';
+import { createChatService } from './chat.js';
 import { newHostId, normalizeHostInput } from './schema.js';
 
 export const inject = ['webServer', 'connection'];
@@ -95,12 +96,25 @@ export async function apply(ctx, config = {}) {
   const logger = createLogger(ctx);
 
   /** 晚到的依赖容器：routes 拿到的是取值函数，所以 store 后到也没问题。 */
-  const state = { store: null, vault: null };
+  const state = { store: null, vault: null, chat: null };
+
+  /**
+   * 对话配置（patch config 的 `chat` 段）。
+   *
+   * provider/model 留空 = 运行时自动挑（第一个有模型的 provider）；
+   * maxContextLines 是终端尾部进 system prompt 的行数。
+   */
+  const chatConfig = {
+    provider: typeof config.chat?.provider === 'string' ? config.chat.provider : '',
+    model: typeof config.chat?.model === 'string' ? config.chat.model : '',
+    maxContextLines: intIn(config.chat?.maxContextLines, 60, 10, 500),
+  };
 
   // 底座：路由立刻注册（不依赖任何可选服务）。
   registerRoutes(ctx, {
     service,
     store: () => state.store,
+    chat: () => state.chat,
     fallbackHosts: buildFallbackHosts(config),
   });
 
@@ -249,6 +263,20 @@ export async function apply(ctx, config = {}) {
   });
   halfDisposers.push(toDisposer(toolsHalf));
 
+  // 对话半：有 llm 服务才挂（右栏 AI 助手）。缺失时 /chat 回 501
+  // chat-unavailable、/llm 回 {available:false}，UI 显示"未配置模型"——
+  // 终端本身永远可用（设计 §2.1 的分层降级）。
+  const chatHalf = ctx.inject(['llm'], (scoped = ctx) => {
+    // 用非抛访问器取服务：声明过 inject 也走 get，形状不符时不炸 apply。
+    const llm = typeof scoped.get === 'function' ? scoped.get('llm') : undefined;
+    state.chat = createChatService({ service, llm: llm ?? null, config: chatConfig, logger });
+    logger(`chat half mounted${llm === undefined || llm === null ? ' (llm missing, degraded)' : ''}`);
+    return () => {
+      state.chat = null;
+    };
+  });
+  halfDisposers.push(toDisposer(chatHalf));
+
   const dispose = async () => {
     // 先撤模型半/持久化半（工具注销、提示词片段移除、DEK 出缓存），
     // 再关会话——顺序反过来的话，注销期间仍有工具能摸到半关的会话。
@@ -262,6 +290,7 @@ export async function apply(ctx, config = {}) {
     service.closeAll();
     state.store = null;
     state.vault = null;
+    state.chat = null;
   };
   /**
    * 引导完成信号。

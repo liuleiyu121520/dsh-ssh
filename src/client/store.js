@@ -677,6 +677,22 @@ function handleChatEvent(sid, event) {
     // 单独记，否则输入区会一直显示"停止"、消息区一直显示"思考中"，而
     // resolveToolCall 开头的 streaming 守卫会把"执行"按钮也一起挡死。
     const awaiting = event.reason === 'tool-call';
+    // 这轮跑通了：把"调用失败"标记与回避记录撤掉——它现在能用了。否则下拉里
+    // 会一直挂着"（调用失败）"，用户以为还坏着（2026-10-24 用户就是照这个
+    // 标签来问"为什么我的 deepseek 会失败"）。
+    if (event.reason !== 'aborted') {
+      const provider = state.llm.picked.provider;
+      const marked = state.llm.providers.some((row) => row.id === provider && row.unavailable === '调用失败');
+      if (marked === true || avoidProviders.includes(provider) === true) {
+        forgetAvoid(provider);
+        setState({
+          llm: {
+            ...state.llm,
+            providers: state.llm.providers.map((row) => (row.id === provider ? { ...row, unavailable: undefined } : row)),
+          },
+        });
+      }
+    }
     const messages = chatOf(sid).messages.slice();
     const last = messages[messages.length - 1];
     if (last !== undefined && last.kind === 'turn' && last.streaming === true) {

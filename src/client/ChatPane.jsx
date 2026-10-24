@@ -13,6 +13,7 @@ import React, { useEffect, useRef, useSyncExternalStore } from 'react';
 import { ChatIcon, ChevronLeftIcon, ChevronRightIcon } from './icons.js';
 import { actions, getState, subscribe } from './store.js';
 import { t } from './locales.js';
+import { parseMarkdown } from './markdown.js';
 
 /** 头部行：标题 + 模型选择 + 自动执行 + 收起按钮。 */
 const headerStyle = {
@@ -55,18 +56,57 @@ const inlineCodeStyle = {
 
 /** 代码块样式。 */
 const codeBlockStyle = {
-  margin: '6px 0',
-  padding: '8px',
+  margin: 0,
+  padding: '8px 10px',
   borderRadius: '6px',
   border: '0.5px solid var(--dsw-alias-border-l2)',
   background: 'var(--dsw-alias-bg-layer-2)',
   color: 'var(--dsw-alias-label-secondary)',
   fontFamily: MONO,
-  fontSize: '11px',
-  lineHeight: '16px',
+  fontSize: '12px',
+  lineHeight: '18px',
   whiteSpace: 'pre-wrap',
   wordBreak: 'break-all',
   overflowX: 'auto',
+};
+
+/** 正文段落：**保留硬换行**（否则整段折叠成一行）。 */
+const paragraphStyle = {
+  margin: 0,
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+};
+
+/** 标题（markdown #）。 */
+const headingStyle = {
+  margin: 0,
+  fontWeight: 500,
+  color: 'var(--dsw-alias-label-primary)',
+};
+
+/** 列表容器。 */
+const listStyle = {
+  margin: 0,
+  paddingLeft: '18px',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '2px',
+};
+
+/** 列表项：项内换行也要保留。 */
+const listItemStyle = {
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+};
+
+/** 引用块。 */
+const quoteStyle = {
+  margin: 0,
+  paddingLeft: '8px',
+  borderLeft: '2px solid var(--dsw-alias-border-l2)',
+  color: 'var(--dsw-alias-label-secondary)',
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
 };
 
 /** 命令卡状态 → 颜色（成功=品牌色，失败=错误色，其余=弱化）。 */
@@ -147,35 +187,62 @@ function inlineNodes(text) {
 }
 
 /**
- * 段落富文本：``` 代码块 + 行内格式。未闭合的代码块按到文本末尾算。
+ * 段落富文本：markdown 块（代码块/标题/列表/引用/段落）+ 行内格式。
+ *
+ * 关键点：**段落与列表项都保留硬换行**（white-space: pre-wrap）。以前整段
+ * 文本塞进一个 <span>，HTML 把换行折叠成空格，面板上就是"一整坨字、没有
+ * 折行"（2026-10-24 用户反馈）。字号/行高对齐 dsh 原生对话（13px / 1.6）。
  * @param {{text: string}} props 参数。
  * @returns {JSX.Element} 渲染结果。
  */
-function RichText({ text }) {
-  /** @type {Array<{kind: string, value: string}>} */
-  const segments = [];
-  const fence = /```[\w-]*\n?([\s\S]*?)(?:```|$)/g;
-  let last = 0;
-  let match = fence.exec(text);
-  while (match !== null) {
-    if (match.index > last) segments.push({ kind: 'text', value: text.slice(last, match.index) });
-    segments.push({ kind: 'code', value: match[1].replace(/\n$/, '') });
-    last = fence.lastIndex;
-    match = fence.exec(text);
-  }
-  if (last < text.length) segments.push({ kind: 'text', value: text.slice(last) });
+export function RichText({ text }) {
+  const blocks = parseMarkdown(text);
   return (
-    <>
-      {segments.map((segment, index) =>
-        segment.kind === 'code' ? (
-          <pre key={`seg${index}`} style={codeBlockStyle}>
-            {segment.value}
-          </pre>
-        ) : (
-          <span key={`seg${index}`}>{inlineNodes(segment.value)}</span>
-        ),
-      )}
-    </>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+      {blocks.map((block, index) => {
+        if (block.kind === 'code') {
+          return (
+            <pre key={`b${index}`} style={codeBlockStyle}>
+              {block.text}
+            </pre>
+          );
+        }
+        if (block.kind === 'heading') {
+          return (
+            <div
+              key={`b${index}`}
+              style={{ ...headingStyle, fontSize: block.level <= 2 ? '14px' : '13px' }}
+            >
+              {inlineNodes(block.text)}
+            </div>
+          );
+        }
+        if (block.kind === 'list') {
+          const ListTag = block.ordered === true ? 'ol' : 'ul';
+          return (
+            <ListTag key={`b${index}`} style={listStyle}>
+              {block.items.map((item, itemIndex) => (
+                <li key={`i${itemIndex}`} style={listItemStyle}>
+                  {inlineNodes(item)}
+                </li>
+              ))}
+            </ListTag>
+          );
+        }
+        if (block.kind === 'quote') {
+          return (
+            <div key={`b${index}`} style={quoteStyle}>
+              {inlineNodes(block.text)}
+            </div>
+          );
+        }
+        return (
+          <div key={`b${index}`} style={paragraphStyle}>
+            {inlineNodes(block.lines.join('\n'))}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -314,8 +381,8 @@ function TurnMessage({ sid, message }) {
       {hasText ? (
         <div
           style={{
-            fontSize: '12px',
-            lineHeight: '19px',
+            fontSize: '13px',
+            lineHeight: 1.6,
             color: 'var(--dsw-alias-label-primary)',
             wordBreak: 'break-word',
           }}

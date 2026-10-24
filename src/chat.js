@@ -47,6 +47,8 @@ const MAX_TIMEOUT_MS = 120000;
 const ABORT_GRACE_MS = 400;
 /** 终端尾部进 system prompt 的默认行数。 */
 const DEFAULT_CONTEXT_LINES = 60;
+/** 终端尾部进 system prompt 的字符上限（行数够但单行可能极长）。 */
+const MAX_TAIL_CHARS = 8000;
 /** history 长度上限（条），超出丢最旧的（system 由 Host 每轮重建，不占位）。 */
 const MAX_HISTORY = 30;
 
@@ -673,7 +675,10 @@ export function createChatService(options = {}) {
       emit({ type: 'model', provider: picked.provider, model: picked.model });
 
       const session = service.get(sid);
-      const tail = stripAnsi(service.readText(sid, contextLines).text);
+      // 行数上限之外再加字符上限：终端里 `cat` 一个大文件时，60 行也可能是
+      // 几百 KB，把 system prompt 撑到离谱的体积（请求体过大在代理上会被
+      // 直接掐连接）。只留尾部——结论通常在最后。
+      const tail = truncateTail(stripAnsi(service.readText(sid, contextLines).text), MAX_TAIL_CHARS);
       const system = buildSystemPrompt({ session, tail, autoExecute: autoExecute === true });
       const history = normalizeHistory(messages, picked);
       if (history.length === 0) {
@@ -728,6 +733,11 @@ export function createChatService(options = {}) {
               messages: history,
               system,
               tools: CHAT_TOOLS,
+              // 原生对话每轮都带 sessionId（adapter 会映射成请求体字段 +
+              // x-deepseek-harness-session-id 头）。账号通道靠它做归属/路由，
+              // 我们之前一个都不带——这是与原生请求最后的形状差异
+              // （2026-10-24 对照 session.v4 日志的 request/header 发现）。
+              sessionId: sid,
               signal,
             }),
             emit,

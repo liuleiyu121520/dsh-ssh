@@ -112,7 +112,10 @@ export const zh = {
   chatUserSkipped: '用户跳过了这条命令的执行',
   chatSuggestHint: '试试这些：',
   chatAutoSwitched: '模型调用失败，已自动切换到：{model}，请重新发送',
-  chatWatchdog: '等待模型响应超时（60 秒无响应），请重试或切换模型',
+  chatWatchdog: '等待模型响应超时（3 分钟没有任何动静），请重试或切换模型',
+  chatReasoning: '思考过程',
+  chatSlow: '模型还在思考（已超过 60 秒），继续等待或点"停止"换模型',
+  chatPendingHint: '先处理上方的命令卡（执行或跳过），才能继续发消息',
   hostsCollapse: '收起主机列表',
   hostsExpand: '展开主机列表',
 
@@ -234,7 +237,10 @@ export const en = {
   chatUserSkipped: 'User skipped this command',
   chatSuggestHint: 'Try:',
   chatAutoSwitched: 'Model call failed, switched to: {model}. Please send again',
-  chatWatchdog: 'Timed out waiting for the model (no response for 60s). Retry or switch models',
+  chatWatchdog: 'Timed out waiting for the model (3 minutes of total silence). Retry or switch models',
+  chatReasoning: 'Thinking',
+  chatSlow: 'The model is still thinking (over 60s). Keep waiting, or press Stop and switch models',
+  chatPendingHint: 'Resolve the command card above (Run or Skip) before sending another message',
   hostsCollapse: 'Collapse hosts',
   hostsExpand: 'Expand hosts',
 

@@ -258,10 +258,11 @@ function normalizeFinish(reason) {
  * 成块收齐（arguments 是完整 JSON 字符串）。
  * @param {AsyncIterable<object>} chunks llm stream。
  * @param {(event: object) => void} onEvent 事件回调。
- * @returns {Promise<{text: string, toolCalls: object[], finishReason: string, finishFailure: object|null}>} 回合结果。
+ * @returns {Promise<{text: string, reasoning: string, toolCalls: object[], finishReason: string, finishFailure: object|null}>} 回合结果。
  */
 async function consumeStream(chunks, onEvent) {
   let text = '';
+  let reasoning = '';
   /** @type {Map<number, {id: string, name: string, args: string}>} */
   const pending = new Map();
   /** @type {object[]} */
@@ -273,6 +274,15 @@ async function consumeStream(chunks, onEvent) {
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
       text += chunk.text;
       onEvent({ type: 'text', text: chunk.text });
+      continue;
+    }
+    // 思考型模型（reasoning effort 生效时）先吐几十秒的 reasoning-delta 才有
+    // 正文。**必须转出去**，否则客户端在整个思考期收不到任何事件：
+    // 面板显示"思考中"却永远没有内容，看门狗还会把健康的长思考当挂死掐掉
+    // （2026-10-24 真机：同一模型在原生对话里能答，在右栏必超时）。
+    if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+      reasoning += chunk.text;
+      onEvent({ type: 'reasoning', text: chunk.text });
       continue;
     }
     if (chunk.type === 'tool-call-delta') {
@@ -304,7 +314,7 @@ async function consumeStream(chunks, onEvent) {
       toolCalls.push({ id: slot.id || `call-${randomBytes(6).toString('hex')}`, name: slot.name, arguments: slot.args || '{}' });
     }
   }
-  return { text, toolCalls, finishReason, finishFailure };
+  return { text, reasoning, toolCalls, finishReason, finishFailure };
 }
 
 /**
@@ -581,15 +591,30 @@ export function createChatService(options = {}) {
     };
     try {
       service.get(sid); // 会话不存在：明确的 404 语义
-      const inventory = await describeModels();
-      if (inventory.available !== true) {
-        emit({ type: 'error', code: 'llm-unavailable', message: '宿主没有可用的模型服务（llm），请在 dsh 里配置模型后重试' });
-        return;
-      }
-      const picked = pickModel(typeof provider === 'string' ? provider : '', typeof model === 'string' ? model : '', inventory.providers);
-      if (picked === null) {
-        emit({ type: 'error', code: 'llm-no-model', message: '没有可用模型：宿主未注册任何 provider 或模型列表为空' });
-        return;
+      // 第一帧：请求已被受理。客户端据此区分"请求没到"和"模型没回"。
+      emit({ type: 'accepted' });
+      const wantedProvider = typeof provider === 'string' ? provider : '';
+      const wantedModel = typeof model === 'string' ? model : '';
+      /** @type {{provider: string, model: string}|null} */
+      let picked = null;
+      if (wantedProvider !== '' && wantedModel !== '') {
+        // 客户端已经明确选了通道与模型：**直接调**，不先跑清单。
+        // describeModels() 是"列清单"（逐 provider listModels，部分通道会碰
+        // 账号/网络），把它放在回合最前面会让用户在第一个事件之前干等；
+        // 原生对话也从不为了发一条消息去列一遍清单。模型 id 不存在时
+        // prepareCall 会当场报错，错误会带通道前缀透给用户，比静默等待好。
+        picked = { provider: wantedProvider, model: wantedModel };
+      } else {
+        const inventory = await describeModels();
+        if (inventory.available !== true) {
+          emit({ type: 'error', code: 'llm-unavailable', message: '宿主没有可用的模型服务（llm），请在 dsh 里配置模型后重试' });
+          return;
+        }
+        picked = pickModel(wantedProvider, wantedModel, inventory.providers);
+        if (picked === null) {
+          emit({ type: 'error', code: 'llm-no-model', message: '没有可用模型：宿主未注册任何 provider 或模型列表为空' });
+          return;
+        }
       }
       emit({ type: 'model', provider: picked.provider, model: picked.model });
 
@@ -602,12 +627,28 @@ export function createChatService(options = {}) {
         return;
       }
 
+      /** 客户端记住的通道可能已经不存在（插件升级/改名）：只回退一次。 */
+      let fellBack = false;
       for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
         if (signal?.aborted === true) {
           emit({ type: 'finish', reason: 'aborted' });
           return;
         }
-        const prepared = await llm.prepareCall({ provider: picked.provider, model: picked.model });
+        let prepared;
+        try {
+          prepared = await llm.prepareCall({ provider: picked.provider, model: picked.model });
+        } catch (error) {
+          // 通道/模型已不存在（旧的 localStorage 选择最常见）：回退到清单里
+          // 第一个健康通道重试一次，别让一个过期选择把用户钉死在错误上。
+          if (fellBack === true) throw error;
+          fellBack = true;
+          const inventory = await describeModels();
+          const fallback = inventory.available === true ? pickModel('', '', inventory.providers) : null;
+          if (fallback === null) throw error;
+          picked = fallback;
+          emit({ type: 'model', provider: picked.provider, model: picked.model });
+          prepared = await llm.prepareCall({ provider: picked.provider, model: picked.model });
+        }
         const result = await consumeStream(
           prepared.stream({
             // 必须把 prepareCall 返回的 config 原样带回：runtime 在这里做

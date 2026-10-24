@@ -87,6 +87,35 @@ const CALL_LABELS = {
   skipped: 'chatSkipped',
 };
 
+/** 思考过程折叠框：比正文更弱、限高，不抢正文的位置。 */
+const reasoningBoxStyle = {
+  margin: '2px 0 4px',
+  padding: '6px 8px',
+  borderRadius: '6px',
+  border: '0.5px solid var(--dsw-alias-border-l2)',
+  background: 'var(--dsw-alias-bg-layer-2)',
+  maxHeight: '160px',
+  overflow: 'auto',
+};
+
+/** 思考过程摘要行。 */
+const reasoningSummaryStyle = {
+  fontSize: '10px',
+  color: 'var(--dsw-alias-label-quaternary)',
+  cursor: 'pointer',
+};
+
+/** 思考过程正文（等宽、弱化、可换行）。 */
+const reasoningTextStyle = {
+  margin: '4px 0 0',
+  fontFamily: MONO,
+  fontSize: '10px',
+  lineHeight: '15px',
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+  color: 'var(--dsw-alias-label-quaternary)',
+};
+
 /**
  * 行内富文本：`code` 与 **bold**。不做完整 markdown——终端场景够用即可。
  * @param {string} text 纯文本。
@@ -264,13 +293,24 @@ function CallCard({ sid, call }) {
  */
 function TurnMessage({ sid, message }) {
   const hasText = typeof message.text === 'string' && message.text !== '';
+  const reasoning = typeof message.reasoning === 'string' ? message.reasoning : '';
   const calls = Array.isArray(message.calls) ? message.calls : [];
-  if (!hasText && calls.length === 0 && message.streaming === true) {
+  if (!hasText && reasoning === '' && calls.length === 0 && message.streaming === true) {
     return <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatThinking')}</div>;
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
       <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatAssistant')}</div>
+      {/* 思考过程：思考型模型先想几十秒才有正文，不显示这段就只剩"卡住"的观感。 */}
+      {reasoning !== '' ? (
+        <details style={reasoningBoxStyle} open={message.streaming === true}>
+          <summary style={reasoningSummaryStyle}>{t('chatReasoning')}</summary>
+          <pre style={reasoningTextStyle}>{reasoning}</pre>
+        </details>
+      ) : null}
+      {hasText === false && message.streaming === true ? (
+        <div style={{ fontSize: '11px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatThinking')}</div>
+      ) : null}
       {hasText ? (
         <div
           style={{
@@ -364,6 +404,9 @@ function ChatMessages({ sid }) {
       {chat.streaming === true && chat.messages.every((message) => message.kind !== 'turn' || message.streaming !== true) ? (
         <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatThinking')}</div>
       ) : null}
+      {chat.slow === true && chat.streaming === true ? (
+        <div style={{ fontSize: '11px', lineHeight: '16px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatSlow')}</div>
+      ) : null}
       {chat.error !== null ? (
         <div
           style={{
@@ -385,18 +428,23 @@ function ChatMessages({ sid }) {
 
 /**
  * 输入区：textarea（Enter 发送 / Shift+Enter 换行）+ 发送/停止按钮。
- * @param {{sid: string, streaming: boolean}} props 参数。
+ *
+ * `streaming`（在途请求）与 `pending`（等用户确认命令卡）都会锁住发送：
+ * 前者是"别插队"，后者是"历史里还有没结果的 tool-call，发出去必被 wire
+ * 校验拒绝"。两者的区别在按钮：只有真在跑的时候才给"停止"。
+ * @param {{sid: string, streaming: boolean, pending: boolean}} props 参数。
  * @returns {JSX.Element} 输入区。
  */
-function ChatComposer({ sid, streaming }) {
+function ChatComposer({ sid, streaming, pending }) {
   const [draft, setDraft] = React.useState('');
+  const locked = streaming === true || pending === true;
   /**
    * 发送当前草稿。
    * @returns {void}
    */
   const submit = () => {
     const text = draft.trim();
-    if (text === '' || streaming === true) return;
+    if (text === '' || locked) return;
     setDraft('');
     void actions.sendChat(text);
   };
@@ -428,7 +476,14 @@ function ChatComposer({ sid, streaming }) {
           background: 'var(--dsw-alias-bg-layer-2)',
         }}
       />
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '6px', marginTop: '6px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '6px' }}>
+        {pending === true ? (
+          <span style={{ flex: '1 1 auto', fontSize: '10px', lineHeight: '14px', color: 'var(--dsw-alias-label-quaternary)' }}>
+            {t('chatPendingHint')}
+          </span>
+        ) : (
+          <span style={{ flex: '1 1 auto' }} />
+        )}
         {streaming === true ? (
           <button
             type="button"
@@ -450,17 +505,17 @@ function ChatComposer({ sid, streaming }) {
         <button
           type="button"
           onClick={submit}
-          disabled={streaming === true || draft.trim() === ''}
+          disabled={locked || draft.trim() === ''}
           style={{
             padding: '5px 16px',
             border: '0.5px solid var(--dsw-alias-brand-primary)',
             borderRadius: '7px',
-            cursor: streaming === true || draft.trim() === '' ? 'default' : 'pointer',
+            cursor: locked || draft.trim() === '' ? 'default' : 'pointer',
             font: 'inherit',
             fontSize: '11px',
             color: 'var(--dsw-alias-brand-primary)',
             background: 'transparent',
-            opacity: streaming === true || draft.trim() === '' ? 0.5 : 1,
+            opacity: locked || draft.trim() === '' ? 0.5 : 1,
           }}
         >
           {t('chatSend')}
@@ -601,7 +656,7 @@ export function ChatPane() {
       <ChatControls />
       <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>{renderBody()}</div>
       {sid !== null && llmUnavailable !== true ? (
-        <ChatComposer sid={sid} streaming={chat?.streaming === true} />
+        <ChatComposer sid={sid} streaming={chat?.streaming === true} pending={chat?.pending === true} />
       ) : null}
     </aside>
   );

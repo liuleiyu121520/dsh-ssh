@@ -318,16 +318,33 @@ const LS_AUTO_EXEC = 'dsh-ssh:chatAutoExec';
 let chatAbort = null;
 /** 最近一次对话事件的时间戳（看门狗用）。 */
 let chatLastEventAt = 0;
-/** 看门狗阈值：60s 无事件视为模型通道挂死。 */
-const WATCHDOG_MS = 60000;
+/**
+ * 看门狗两档阈值。
+ *
+ * 只有 60s 硬超时是不够的：思考型模型（reasoning effort）单是思考就可能
+ * 超过 60s，而通道侧（如 our-free-model 的 combo）在出首个正文前会把
+ * reasoning 增量整个缓冲住、一个字节都不吐——两者都不是"挂死"，掐掉只会
+ * 把能答的回合变成超时（2026-10-24 真机：同一模型原生对话能答、右栏必超时）。
+ *
+ * 所以：60s 只**提示**"还在等"，180s 才是真挂死（连心跳都没有）。
+ */
+const WATCHDOG_SLOW_MS = 60000;
+const WATCHDOG_HARD_MS = 180000;
 
 /**
  * 取（或懒建）一个会话的对话状态。
+ *
+ * 三个布尔各有各的意思，**不能合并**：
+ * - `streaming`：有在途请求（模型正在吐字/跑命令）；
+ * - `pending`：回合因工具调用暂停，等用户点"执行/跳过"——此时既不能发新
+ *   消息（历史里会留下没有结果的 tool-call，wire 校验必炸），也不该显示
+ *   "停止"（没有可停的东西）；
+ * - `slow`：看门狗提示"还在等模型"，纯 UI 提示，不影响请求。
  * @param {string} sid 会话 id。
  * @returns {object} 对话状态。
  */
 function chatOf(sid) {
-  return state.chats[sid] ?? { messages: [], streaming: false, error: null };
+  return state.chats[sid] ?? { messages: [], streaming: false, pending: false, slow: false, error: null };
 }
 
 /**
@@ -364,6 +381,31 @@ function appendTurnText(sid, text) {
     messages[messages.length - 1] = { ...last, text: last.text + text };
   } else {
     messages.push({ role: 'assistant', kind: 'turn', text, calls: [], streaming: true });
+  }
+  patchChat(sid, { messages });
+}
+
+/** 思考文本在客户端保留的最大字符数（截尾：结论在最后）。 */
+const MAX_REASONING_CHARS = 8000;
+
+/**
+ * 把流式"思考"增量并进当前回合（没有就新建一个）。
+ *
+ * 思考不落进 llm history（只是给人看的进度），所以单独一个字段，长度截尾
+ * 保留——思考几万字时既不该撑爆内存，也没必要全留。
+ * @param {string} sid 会话 id。
+ * @param {string} text 增量文本。
+ * @returns {void}
+ */
+function appendTurnReasoning(sid, text) {
+  const messages = chatOf(sid).messages.slice();
+  const last = messages[messages.length - 1];
+  const merged = `${last !== undefined && last.kind === 'turn' ? last.reasoning ?? '' : ''}${text}`;
+  const kept = merged.length > MAX_REASONING_CHARS ? merged.slice(-MAX_REASONING_CHARS) : merged;
+  if (last !== undefined && last.kind === 'turn' && last.streaming === true) {
+    messages[messages.length - 1] = { ...last, reasoning: kept };
+  } else {
+    messages.push({ role: 'assistant', kind: 'turn', text: '', calls: [], reasoning: kept, streaming: true });
   }
   patchChat(sid, { messages });
 }
@@ -495,6 +537,10 @@ function handleChatEvent(sid, event) {
     setState({ llm: { ...state.llm, picked: { provider: event.provider, model: event.model } } });
     return;
   }
+  if (event?.type === 'reasoning' && typeof event.text === 'string') {
+    appendTurnReasoning(sid, event.text);
+    return;
+  }
   if (event?.type === 'text' && typeof event.text === 'string') {
     appendTurnText(sid, event.text);
     return;
@@ -513,7 +559,7 @@ function handleChatEvent(sid, event) {
     return;
   }
   if (event?.type === 'error') {
-    patchChat(sid, { streaming: false, error: typeof event.message === 'string' ? event.message : 'unknown error' });
+    patchChat(sid, { streaming: false, pending: false, slow: false, error: typeof event.message === 'string' ? event.message : 'unknown error' });
     // 模型级失败：自动把选择切到第一个健康通道并清掉本地记忆——
     // 否则 localStorage 里的坏选择会把用户钉死在同一个错误上。
     // 会话级错误（会话没了/历史为空）不在此列，与模型无关。
@@ -536,13 +582,18 @@ function handleChatEvent(sid, event) {
   if (event?.type === 'finish') {
     // tool-call = 人工确认模式下回合暂停，等用户逐条执行/跳过后续跑。
     // 其余 reason（stop / max-rounds / aborted）= 回合结束。
+    //
+    // 暂停**不是**流式：`streaming` 只表示"有在途请求"。暂停用 `pending`
+    // 单独记，否则输入区会一直显示"停止"、消息区一直显示"思考中"，而
+    // resolveToolCall 开头的 streaming 守卫会把"执行"按钮也一起挡死。
+    const awaiting = event.reason === 'tool-call';
     const messages = chatOf(sid).messages.slice();
     const last = messages[messages.length - 1];
     if (last !== undefined && last.kind === 'turn' && last.streaming === true) {
       messages[messages.length - 1] = { ...last, streaming: false };
-      patchChat(sid, { messages, streaming: event.reason === 'tool-call' });
+      patchChat(sid, { messages, streaming: false, pending: awaiting, slow: false });
     } else {
-      patchChat(sid, { streaming: event.reason === 'tool-call' });
+      patchChat(sid, { streaming: false, pending: awaiting, slow: false });
     }
   }
 }
@@ -556,18 +607,23 @@ async function runChatTurn(sid) {
   const current = chatOf(sid);
   if (chatAbort !== null) return; // 同一会话只允许一个在途回合
   chatAbort = new AbortController();
-  patchChat(sid, { streaming: true, error: null });
-  // 看门狗：60s 无任何事件（含 model/tool-call 心跳类）→ 主动断开。
-  // runtime 对 TRANSPORT 类失败会内部重试（退避可达几十秒），不设看门狗
-  // 用户会停在"思考中"很久（2026-10-24 真机实测）。
+  patchChat(sid, { streaming: true, pending: false, slow: false, error: null });
+  // 看门狗：60s 没事件只提示"还在等"，180s 才断开。
+  // 为什么不是 60s 直接掐：思考型模型单是思考就可能超过 60s，且部分通道
+  // 在首个正文前会把 reasoning 整个缓冲住（一个事件都不吐）。60s 硬掐等于
+  // 把能答的回合变成超时——同一模型在原生对话里能答、在右栏必挂，就是这么
+  // 来的（2026-10-24 真机）。真挂死的特征是**连心跳都没有**，180s 足够。
   chatLastEventAt = Date.now();
   let watchdogFired = false;
   const controller = chatAbort;
   const watchdog = setInterval(() => {
-    if (Date.now() - chatLastEventAt > WATCHDOG_MS) {
+    const silent = Date.now() - chatLastEventAt;
+    if (silent > WATCHDOG_HARD_MS) {
       watchdogFired = true;
       controller.abort();
+      return;
     }
+    if (silent > WATCHDOG_SLOW_MS && chatOf(sid).slow !== true) patchChat(sid, { slow: true });
   }, 5000);
   try {
     const response = await fetch(`${API}/chat`, {
@@ -595,15 +651,22 @@ async function runChatTurn(sid) {
     }
     await readChatStream(response, (event) => {
       chatLastEventAt = Date.now();
+      // 有动静就把"还在等"的提示撤掉（reasoning 增量也算动静）。
+      if (chatOf(sid).slow === true) patchChat(sid, { slow: false });
       handleChatEvent(sid, event);
     });
     patchChat(sid, { streaming: false });
   } catch (error) {
     if (watchdogFired === true) {
-      patchChat(sid, { streaming: false, error: t('chatWatchdog') });
+      patchChat(sid, { streaming: false, pending: false, slow: false, error: t('chatWatchdog') });
     } else {
       // AbortError 是用户点"停止"：静默收尾，不当成错误展示。
-      patchChat(sid, { streaming: false, error: error?.name === 'AbortError' ? null : (error?.message ?? String(error)) });
+      patchChat(sid, {
+        streaming: false,
+        pending: false,
+        slow: false,
+        error: error?.name === 'AbortError' ? null : (error?.message ?? String(error)),
+      });
     }
   } finally {
     clearInterval(watchdog);
@@ -1286,7 +1349,10 @@ export const actions = {
     const sid = state.activeSid;
     const trimmed = typeof text === 'string' ? text.trim() : '';
     if (sid === null || trimmed === '') return;
-    if (chatOf(sid).streaming === true) return;
+    const chat = chatOf(sid);
+    // pending 时不能发新消息：历史里会留下没有 tool 结果的 tool-call，
+    // wire 校验必然拒绝，整轮白跑。先让用户把命令卡处理掉。
+    if (chat.streaming === true || chat.pending === true) return;
     appendChatMessage(sid, { role: 'user', content: trimmed });
     await runChatTurn(sid);
   },

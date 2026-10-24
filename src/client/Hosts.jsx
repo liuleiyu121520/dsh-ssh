@@ -16,7 +16,8 @@ import { t } from './locales.js';
 
 /** 状态 -> 状态灯颜色。只用 --dsw-alias-* 变量，不判断明暗。 */
 const LIGHT_COLORS = {
-  open: 'var(--dsw-alias-brand-primary)',
+  // 已连接用系统状态绿（与 dsh 其它"在线"指示一致），品牌蓝留给可点操作。
+  open: 'var(--dsw-alias-state-success-primary)',
   connecting: 'var(--dsw-alias-label-tertiary)',
   closed: 'var(--dsw-alias-label-tertiary)',
   error: 'var(--dsw-alias-label-error)',

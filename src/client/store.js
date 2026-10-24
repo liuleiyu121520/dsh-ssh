@@ -42,6 +42,8 @@ let state = {
   tabs: [],
   activeSid: null,
   chatOpen: true,
+  /** 授权档位：auto | danger | always（默认 danger：只拦危险命令）。 */
+  chatApproval: 'danger',
   toast: null,
   /** sid -> 回放缺口信息（{truncated, firstSeq, dropped, since}）；左栏据此标记"回放缺口"。 */
   gaps: {},
@@ -71,8 +73,6 @@ let state = {
    * @type {object}
    */
   llm: { status: 'idle', providers: [], picked: { provider: '', model: '' } },
-  /** 自动执行开关（命令不经确认直接跑）；持久化在 localStorage。 */
-  chatAutoExec: false,
   /** 左栏主机列表是否收起。 */
   hostsCollapsed: false,
   /** 左栏当前高亮的主机 id（单击只选中，双击才连接）。 */
@@ -324,7 +324,11 @@ function pickHealthy(providers, avoid = []) {
   }
   return { provider: '', model: '' };
 }
-const LS_AUTO_EXEC = 'dsh-ssh:chatAutoExec';
+const LS_APPROVAL = 'dsh-ssh:chatApproval';
+/** 旧版布尔开关的键：迁移用，读到 '1' 视为 auto。 */
+const LS_AUTO_EXEC_LEGACY = 'dsh-ssh:chatAutoExec';
+/** 合法档位。 */
+const APPROVALS = ['auto', 'danger', 'always'];
 
 /** localStorage 键：调用失败过的通道（重启后也别再自动选它）。 */
 const LS_AVOID = 'dsh-ssh:chatAvoid';
@@ -488,7 +492,10 @@ function appendTurnCall(sid, call) {
     name: call.name,
     command: call.command,
     arguments: call.arguments,
-    status: state.chatAutoExec === true ? 'running' : 'awaiting',
+    // 只有 Host 明确要求确认的卡片才停在 awaiting；自动执行的直接算 running
+    // （danger 档下同一个回合里可能两种都有）。
+    status: call.needsConfirm === true ? 'awaiting' : 'running',
+    dangerous: call.dangerous === true,
     ok: null,
     output: '',
     timedOut: false,
@@ -755,7 +762,7 @@ async function runChatTurn(sid, options = {}) {
       body: JSON.stringify({
         sid,
         messages: buildChatHistory(current.messages),
-        autoExecute: state.chatAutoExec === true,
+        approval: state.chatApproval,
         provider: state.llm.picked.provider,
         model: state.llm.picked.model,
       }),
@@ -1455,26 +1462,39 @@ export const actions = {
   },
 
   /**
-   * 自动执行开关。持久化到 localStorage；关 = 每条命令等用户点"执行"。
+   * 设置授权档位（auto | danger | always）。持久化到 localStorage。
+   * @param {string} approval 档位。
    * @returns {void}
    */
-  toggleAutoExec() {
-    const next = state.chatAutoExec !== true;
-    setState({ chatAutoExec: next });
+  setApproval(approval) {
+    if (APPROVALS.includes(approval) === false) return;
+    setState({ chatApproval: approval });
     try {
-      localStorage.setItem(LS_AUTO_EXEC, next ? '1' : '0');
+      localStorage.setItem(LS_APPROVAL, approval);
     } catch {
-      // 忽略：开关当场生效，重启后回默认。
+      // 忽略：当场生效，重启后回默认。
     }
   },
 
   /**
-   * 从 localStorage 恢复自动执行开关（view 挂载时调一次）。
+   * 从 localStorage 恢复授权档位（view 挂载时调一次）。
+   *
+   * 迁移：老版本存的是布尔开关 `dsh-ssh:chatAutoExec`（'1' = 全自动），
+   * 读到就换算成 auto/always，然后清掉旧键，别让两套偏好并存。
    * @returns {void}
    */
   restoreChatPrefs() {
     try {
-      if (localStorage.getItem(LS_AUTO_EXEC) === '1') setState({ chatAutoExec: true });
+      const saved = localStorage.getItem(LS_APPROVAL);
+      if (saved !== null && APPROVALS.includes(saved)) {
+        setState({ chatApproval: saved });
+        return;
+      }
+      const legacy = localStorage.getItem(LS_AUTO_EXEC_LEGACY);
+      if (legacy !== null) {
+        setState({ chatApproval: legacy === '1' ? 'auto' : 'always' });
+        localStorage.removeItem(LS_AUTO_EXEC_LEGACY);
+      }
     } catch {
       // 忽略。
     }

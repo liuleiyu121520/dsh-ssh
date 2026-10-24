@@ -367,6 +367,7 @@ async function handleChat(getChat, req, res) {
       sid,
       messages,
       autoExecute: body.autoExecute === true,
+      approval: typeof body.approval === 'string' ? body.approval : undefined,
       provider: typeof body.provider === 'string' ? body.provider : '',
       model: typeof body.model === 'string' ? body.model : '',
       signal: controller.signal,

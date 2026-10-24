@@ -673,3 +673,87 @@ test('runTurn hands the adapter block arrays (DeepSeek serializer shape)', async
   });
   assert.deepEqual(events.map((event) => event.type), ['accepted', 'model', 'text', 'finish']);
 });
+
+// ── 三档授权：auto / danger / always ───────────────────────────────────
+
+test('danger 档：只读命令直接跑，危险命令停下来等确认', async () => {
+  const { service, created } = makeShellService(shellWith('/dev/disk1s1 500G 200G'));
+  service.open({ host: LOCAL_HOST });
+  const llm = makeFakeLlm([toolRound, textRound]);
+  const chat = createChatService({ service, llm });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '磁盘呢' }],
+    approval: 'danger',
+    onEvent: (event) => events.push(event),
+  });
+  // df -h 是只读命令：不该出确认卡，直接执行。
+  const call = events.find((event) => event.type === 'tool-call');
+  assert.equal(call.needsConfirm, undefined);
+  assert.equal(events.some((event) => event.type === 'tool-result'), true, '只读命令应自动执行');
+  assert.equal(Buffer.concat(created[0].sent).toString('utf8').includes('df -h'), true);
+});
+
+test('danger 档：rm -rf 必须停下来等用户确认', async () => {
+  const { service, created } = makeShellService(shellWith('x'));
+  service.open({ host: LOCAL_HOST });
+  /** 一轮：模型要删目录。 */
+  function* dangerousRound() {
+    yield {
+      type: 'block-end',
+      index: 1,
+      block: { type: 'tool-call', id: 'call-9', name: 'run_command', arguments: '{"command":"rm -rf /var/www/cache"}' },
+    };
+    yield { type: 'finish', reason: { kind: 'tool-calls' } };
+  }
+  const chat = createChatService({ service, llm: makeFakeLlm([dangerousRound, textRound]) });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '清一下缓存' }],
+    approval: 'danger',
+    onEvent: (event) => events.push(event),
+  });
+  const call = events.find((event) => event.type === 'tool-call');
+  assert.equal(call.needsConfirm, true, '危险命令要确认');
+  assert.equal(call.dangerous, true);
+  assert.equal(events.at(-1).reason, 'tool-call', '回合应停在确认点');
+  // 关键：命令绝不能已经进了 PTY。
+  assert.equal(Buffer.concat(created[0].sent).toString('utf8').includes('rm -rf'), false);
+});
+
+test('always 档每条都确认，auto 档一条都不确认', async () => {
+  for (const [approval, expectConfirm] of [['always', true], ['auto', false]]) {
+    const { service } = makeShellService(shellWith('ok'));
+    service.open({ host: LOCAL_HOST });
+    const chat = createChatService({ service, llm: makeFakeLlm([toolRound, textRound]) });
+    /** @type {object[]} */
+    const events = [];
+    await chat.runTurn({
+      sid: 's1',
+      messages: [{ role: 'user', content: '磁盘呢' }],
+      approval,
+      onEvent: (event) => events.push(event),
+    });
+    const call = events.find((event) => event.type === 'tool-call');
+    assert.equal(call.needsConfirm === true, expectConfirm, `${approval} 档的确认策略不对`);
+  }
+});
+
+test('老客户端只发 autoExecute 布尔值时按 auto/always 兼容', async () => {
+  const { service } = makeShellService(shellWith('ok'));
+  service.open({ host: LOCAL_HOST });
+  const chat = createChatService({ service, llm: makeFakeLlm([toolRound, textRound]) });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '磁盘呢' }],
+    autoExecute: false,
+    onEvent: (event) => events.push(event),
+  });
+  assert.equal(events.find((event) => event.type === 'tool-call').needsConfirm, true);
+});

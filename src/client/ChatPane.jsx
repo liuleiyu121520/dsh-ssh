@@ -558,8 +558,61 @@ function ChatMessages({ sid }) {
   );
 }
 
+/** 输入框外框：一个圆角盒子装下输入区与底部控件（对齐 dsh 原生 composer）。 */
+const composerBoxStyle = {
+  margin: '8px',
+  padding: '6px 6px 4px',
+  border: '0.5px solid var(--dsw-alias-border-l3)',
+  borderRadius: '12px',
+  background: 'var(--dsw-alias-bg-layer-2)',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '4px',
+};
+
+/** 无边框输入区（描边交给外框）。 */
+const composerInputStyle = {
+  width: '100%',
+  boxSizing: 'border-box',
+  padding: '4px 4px 0',
+  border: 'none',
+  outline: 'none',
+  resize: 'none',
+  background: 'transparent',
+  font: 'inherit',
+  fontSize: '13px',
+  lineHeight: '19px',
+  color: 'var(--dsw-alias-label-primary)',
+};
+
+/** 底部控件行。 */
+const composerRowStyle = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: '4px',
+  minHeight: '26px',
+};
+
+/** 控件胶囊（模型 / 授权）：小、低对比、不抢输入区的视觉重心。 */
+const pillStyle = {
+  maxWidth: '46%',
+  height: '24px',
+  padding: '0 6px',
+  border: '0.5px solid var(--dsw-alias-border-l2)',
+  borderRadius: '6px',
+  background: 'transparent',
+  font: 'inherit',
+  fontSize: '11px',
+  color: 'var(--dsw-alias-label-secondary)',
+  cursor: 'pointer',
+};
+
 /**
- * 输入区：textarea（Enter 发送 / Shift+Enter 换行）+ 发送/停止按钮。
+ * 输入区：一个盒子 = 输入框 + 底部控件（模型 / 授权 / 发送）。
+ *
+ * 控件放进盒子里是照 dsh 原生 composer 的排布：模型与授权是"这次对话怎么跑"
+ * 的设置，跟输入属于同一组，放外面会让右栏多一条常驻工具栏（2026-10-24 用户
+ * 要求）。
  *
  * `streaming`（在途请求）与 `pending`（等用户确认命令卡）都会锁住发送：
  * 前者是"别插队"，后者是"历史里还有没结果的 tool-call，发出去必被 wire
@@ -569,7 +622,10 @@ function ChatMessages({ sid }) {
  */
 function ChatComposer({ sid, streaming, pending }) {
   const [draft, setDraft] = React.useState('');
+  const llm = getState().llm;
+  const approval = getState().chatApproval;
   const locked = streaming === true || pending === true;
+  const canSend = locked === false && draft.trim() !== '';
   /**
    * 发送当前草稿。
    * @returns {void}
@@ -581,7 +637,7 @@ function ChatComposer({ sid, streaming, pending }) {
     void actions.sendChat(text);
   };
   return (
-    <div style={{ borderTop: '0.5px solid var(--dsw-alias-border-l2)', padding: '8px' }}>
+    <div style={composerBoxStyle}>
       <textarea
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
@@ -593,37 +649,54 @@ function ChatComposer({ sid, streaming, pending }) {
           }
         }}
         placeholder={t('chatPlaceholder')}
-        rows={3}
-        style={{
-          width: '100%',
-          boxSizing: 'border-box',
-          padding: '7px 9px',
-          border: '0.5px solid var(--dsw-alias-border-l2)',
-          borderRadius: '8px',
-          resize: 'none',
-          font: 'inherit',
-          fontSize: '12px',
-          lineHeight: '18px',
-          color: 'var(--dsw-alias-label-primary)',
-          background: 'var(--dsw-alias-bg-layer-2)',
-        }}
+        rows={2}
+        style={composerInputStyle}
       />
-      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '6px' }}>
-        {pending === true ? (
-          <span style={{ flex: '1 1 auto', fontSize: '10px', lineHeight: '14px', color: 'var(--dsw-alias-label-quaternary)' }}>
-            {t('chatPendingHint')}
-          </span>
-        ) : (
-          <span style={{ flex: '1 1 auto' }} />
-        )}
+      <div style={composerRowStyle}>
+        {llm.status === 'ready' ? (
+          <select
+            value={`${llm.picked.provider}::${llm.picked.model}`}
+            onChange={(event) => {
+              const [provider, ...rest] = event.target.value.split('::');
+              actions.setChatModel(provider, rest.join('::'));
+            }}
+            title={t('chatModel')}
+            style={pillStyle}
+          >
+            {llm.providers.map((provider) => (
+              <optgroup
+                key={provider.id}
+                label={provider.unavailable !== undefined ? `${provider.name}（${provider.unavailable}）` : provider.name}
+              >
+                {(provider.models ?? []).map((model) => (
+                  <option key={`${provider.id}::${model.id}`} value={`${provider.id}::${model.id}`}>
+                    {model.label !== '' ? model.label : model.id}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        ) : null}
+        <select
+          value={approval}
+          onChange={(event) => actions.setApproval(event.target.value)}
+          title={t('chatApproval')}
+          style={pillStyle}
+        >
+          <option value="auto">{t('chatApprovalAuto')}</option>
+          <option value="danger">{t('chatApprovalDanger')}</option>
+          <option value="always">{t('chatApprovalAlways')}</option>
+        </select>
+        <span style={{ flex: '1 1 auto' }} />
         {streaming === true ? (
           <button
             type="button"
             onClick={actions.stopChat}
             style={{
-              padding: '5px 14px',
+              height: '24px',
+              padding: '0 10px',
               border: '0.5px solid var(--dsw-alias-border-l2)',
-              borderRadius: '7px',
+              borderRadius: '6px',
               cursor: 'pointer',
               font: 'inherit',
               fontSize: '11px',
@@ -637,86 +710,28 @@ function ChatComposer({ sid, streaming, pending }) {
         <button
           type="button"
           onClick={submit}
-          disabled={locked || draft.trim() === ''}
+          disabled={canSend === false}
           style={{
-            padding: '5px 16px',
-            border: '0.5px solid var(--dsw-alias-brand-primary)',
-            borderRadius: '7px',
-            cursor: locked || draft.trim() === '' ? 'default' : 'pointer',
+            height: '24px',
+            padding: '0 12px',
+            border: 'none',
+            borderRadius: '6px',
+            cursor: canSend === true ? 'pointer' : 'default',
             font: 'inherit',
             fontSize: '11px',
-            color: 'var(--dsw-alias-brand-primary)',
-            background: 'transparent',
-            opacity: locked || draft.trim() === '' ? 0.5 : 1,
+            color: 'var(--dsw-alias-label-primary-foreground)',
+            background: 'var(--dsw-alias-brand-primary)',
+            opacity: canSend === true ? 1 : 0.4,
           }}
         >
           {t('chatSend')}
         </button>
       </div>
-    </div>
-  );
-}
-
-/**
- * 模型选择 + 自动执行开关（输入区上方一行）。
- * @returns {JSX.Element} 控制行。
- */
-function ChatControls() {
-  const llm = getState().llm;
-  const autoExec = getState().chatAutoExec;
-  if (llm.status !== 'ready') return null;
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 12px', borderBottom: '0.5px solid var(--dsw-alias-border-l2)' }}>
-      <span style={{ flex: '0 0 auto', fontSize: '10px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatModel')}</span>
-      <select
-        value={`${llm.picked.provider}::${llm.picked.model}`}
-        onChange={(event) => {
-          const [provider, ...rest] = event.target.value.split('::');
-          actions.setChatModel(provider, rest.join('::'));
-        }}
-        style={{
-          flex: '1 1 auto',
-          minWidth: 0,
-          padding: '3px 6px',
-          border: '0.5px solid var(--dsw-alias-border-l2)',
-          borderRadius: '6px',
-          font: 'inherit',
-          fontSize: '10px',
-          color: 'var(--dsw-alias-label-secondary)',
-          background: 'var(--dsw-alias-bg-layer-2)',
-        }}
-      >
-        {llm.providers.map((provider) => (
-          <optgroup
-            key={provider.id}
-            label={provider.unavailable !== undefined ? `${provider.name}（${provider.unavailable}）` : provider.name}
-          >
-            {(provider.models ?? []).map((model) => (
-              <option key={`${provider.id}::${model.id}`} value={`${provider.id}::${model.id}`}>
-                {model.label !== '' ? model.label : model.id}
-              </option>
-            ))}
-          </optgroup>
-        ))}
-      </select>
-      <button
-        type="button"
-        onClick={actions.toggleAutoExec}
-        title={autoExec === true ? t('chatAutoExecOn') : t('chatAutoExecOff')}
-        style={{
-          flex: '0 0 auto',
-          padding: '3px 8px',
-          border: `0.5px solid ${autoExec === true ? 'var(--dsw-alias-label-error)' : 'var(--dsw-alias-border-l2)'}`,
-          borderRadius: '6px',
-          cursor: 'pointer',
-          font: 'inherit',
-          fontSize: '10px',
-          color: autoExec === true ? 'var(--dsw-alias-label-error)' : 'var(--dsw-alias-label-tertiary)',
-          background: 'transparent',
-        }}
-      >
-        {t('chatAutoExec')}
-      </button>
+      {pending === true ? (
+        <div style={{ padding: '0 4px 2px', fontSize: '10px', lineHeight: '14px', color: 'var(--dsw-alias-label-quaternary)' }}>
+          {t('chatPendingHint')}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -785,7 +800,6 @@ export function ChatPane() {
           <ChevronRightIcon size={14} />
         </button>
       </div>
-      <ChatControls />
       <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>{renderBody()}</div>
       {sid !== null && llmUnavailable !== true ? (
         <ChatComposer sid={sid} streaming={chat?.streaming === true} pending={chat?.pending === true} />

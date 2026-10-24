@@ -31,6 +31,7 @@
  * - 输出喂给模型前做 ANSI 清洗 + 截断，system prompt 不含任何秘密。
  */
 import { randomBytes } from 'node:crypto';
+import { isDangerousCommand } from './danger.js';
 
 /** 喂给模型的输出最大字符数（超出截断尾部并标注）。 */
 const MAX_OUTPUT_CHARS = 6000;
@@ -40,6 +41,13 @@ const MAX_PREVIEW_CHARS = 1200;
 const MAX_TOOL_ROUNDS = 6;
 /** 一次模型调用的重试硬上限（'always' 策略也不会超过它）。 */
 const HARD_MAX_RETRIES = 6;
+/**
+ * 授权三档：
+ * - `auto`   命令直接执行；
+ * - `danger` 只拦危险命令（rm -rf / 重启 / 停服务…，见 src/danger.js）；
+ * - `always` 每条命令都要用户点确认。
+ */
+const APPROVALS = Object.freeze(['auto', 'danger', 'always']);
 /** 默认命令超时（毫秒）与硬上限。 */
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TIMEOUT_MS = 120000;
@@ -214,10 +222,10 @@ function normalizeContent(content) {
  * @param {object} params 参数。
  * @param {object} params.session 会话记录（内部形态）。
  * @param {string} params.tail 终端尾部文本（已 ANSI 清洗）。
- * @param {boolean} params.autoExecute 是否自动执行（影响措辞）。
+ * @param {'auto'|'danger'|'always'} params.approval 授权档位（影响措辞）。
  * @returns {string} system prompt。
  */
-function buildSystemPrompt({ session, tail, autoExecute }) {
+function buildSystemPrompt({ session, tail, approval }) {
   const host = session.host ?? {};
   const lines = [
     '你是 dsh-ssh 内置的 SSH 运维助手，运行在用户的远程终端面板旁。',
@@ -233,9 +241,11 @@ function buildSystemPrompt({ session, tail, autoExecute }) {
     '2. 破坏性操作（删除、重启服务、改配置）必须先说明影响，等用户确认。',
     '3. 回复用简体中文，命令用 markdown 代码块；结论先行，步骤从简。',
     '4. 命令要非交互、单行；需要交互的用非交互替代写法。',
-    autoExecute
+    approval === 'auto'
       ? '5. 当前是自动执行模式：你调用的 run_command 会被立即执行，请对每条命令有把握。'
-      : '5. 当前是人工确认模式：你提出的命令会展示给用户，由用户决定是否执行。',
+      : approval === 'danger'
+        ? '5. 当前是"危险命令确认"模式：只读/低风险命令会自动执行，删除、重启、停服务等破坏性命令会先请用户确认。'
+        : '5. 当前是人工确认模式：你提出的每条命令都会展示给用户，由用户决定是否执行。',
     '',
     '终端最后几十行输出（可能不完整，以命令实测为准）：',
     '```',
@@ -646,7 +656,12 @@ export function createChatService(options = {}) {
    * @param {(event: object) => void} params.onEvent 事件回调。
    * @returns {Promise<void>} 完成即 resolve（错误也以事件形式发出，不抛）。
    */
-  const runTurn = async ({ sid, messages, autoExecute, provider, model, signal, onEvent }) => {
+  const runTurn = async ({ sid, messages, autoExecute, approval: approvalInput, provider, model, signal, onEvent }) => {
+    // 授权三档：auto（直接跑）/ danger（危险命令才确认）/ always（每条都确认）。
+    // 老客户端只发 autoExecute 布尔值，按 true→auto、false→always 兼容。
+    const approval = APPROVALS.includes(approvalInput)
+      ? approvalInput
+      : (autoExecute === true ? 'auto' : 'always');
     const emit = (event) => {
       try {
         onEvent(event);
@@ -688,7 +703,7 @@ export function createChatService(options = {}) {
       // 几百 KB，把 system prompt 撑到离谱的体积（请求体过大在代理上会被
       // 直接掐连接）。只留尾部——结论通常在最后。
       const tail = truncateTail(stripAnsi(service.readText(sid, contextLines).text), MAX_TAIL_CHARS);
-      const system = buildSystemPrompt({ session, tail, autoExecute: autoExecute === true });
+      const system = buildSystemPrompt({ session, tail, approval });
       const history = normalizeHistory(messages, picked);
       if (history.length === 0) {
         emit({ type: 'error', code: 'empty-history', message: '对话历史为空' });
@@ -825,10 +840,20 @@ export function createChatService(options = {}) {
             emit({ type: 'tool-result', id: call.id, ok: false, output: message });
             continue;
           }
-          emit({ type: 'tool-call', id: call.id, name: call.name, command: args.command, arguments: call.arguments });
-          if (autoExecute !== true) {
-            // 人工确认：本批全部命令先展示给用户，回合到此暂停；客户端逐条
-            // 执行/跳过后带 tool 结果再次 POST，循环从下一轮继续。
+          // danger 档：只拦危险命令；always 档：每条都拦。
+          const dangerous = approval === 'danger' ? isDangerousCommand(args.command) : false;
+          const needsConfirm = approval === 'always' || (approval === 'danger' && dangerous);
+          emit({
+            type: 'tool-call',
+            id: call.id,
+            name: call.name,
+            command: args.command,
+            arguments: call.arguments,
+            ...needsConfirm ? { needsConfirm: true, dangerous } : {},
+          });
+          if (needsConfirm) {
+            // 需要确认：命令先展示给用户，回合到此暂停；客户端逐条执行/跳过
+            // 后带 tool 结果再次 POST，循环从下一轮继续。
             paused = true;
             continue;
           }

@@ -52,7 +52,7 @@ const calls = [];
 const script = [
   [
     { type: 'model', provider: 'p1', model: 'm1' },
-    { type: 'tool-call', id: 'c1', name: 'run_command', command: 'df -h /', arguments: '{"command":"df -h /"}' },
+    { type: 'tool-call', id: 'c1', name: 'run_command', command: 'df -h /', arguments: '{"command":"df -h /"}', needsConfirm: true },
     { type: 'finish', reason: 'tool-call' },
   ],
   [

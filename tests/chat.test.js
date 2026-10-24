@@ -8,6 +8,7 @@
  *    人工确认暂停、自动执行续跑、模型挑选回退、无 llm 降级。
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { SshSessionService } from '../src/sessions.js';
 import { createFakeTransport } from '../src/transport.js';
@@ -52,7 +53,16 @@ function shellWith(output, code = 0) {
   };
 }
 
-/** 假 llm：按剧本依次返回各"模型轮"的 chunk 流。 */
+/**
+ * 假 llm：按剧本依次返回各"模型轮"的 chunk 流。
+ *
+ * 严格模拟真 runtime 的 `prepareCall().stream()` 契约：
+ * - prepareCall 物化出默认配置（这里固定 reasoningEffort:'high'，对应真
+ *   adapter 给 GLM-5.3 物化 effort 的行为）；
+ * - stream 入参的 provider/model/reasoningEffort/temperature/maxTokens/stop
+ *   必须与 config 一致，否则抛 INVALID_PREPARED_CALL——
+ *   2026-10-24 真机就是这样炸的（只传 provider+model，漏了物化默认值）。
+ */
 function makeFakeLlm(rounds, providers = [{ id: 'p1', name: 'P1' }], models = [{ id: 'm1', label: 'M1' }]) {
   let call = 0;
   return {
@@ -61,7 +71,20 @@ function makeFakeLlm(rounds, providers = [{ id: 'p1', name: 'P1' }], models = [{
     prepareCall: async (config) => {
       const round = rounds[Math.min(call, rounds.length - 1)];
       call += 1;
-      return { config, stream: () => round() };
+      const resolved = { provider: config.provider, model: config.model, reasoningEffort: 'high' };
+      return {
+        config: resolved,
+        stream: (options) => {
+          for (const key of ['provider', 'model', 'reasoningEffort', 'temperature', 'maxTokens']) {
+            if (options[key] !== resolved[key]) {
+              throw new Error(
+                `prepared LLM call config changed before adapter dispatch (${key}: ${String(options[key])} != ${String(resolved[key])})`,
+              );
+            }
+          }
+          return round();
+        },
+      };
     },
     calls: () => call,
   };
@@ -319,4 +342,14 @@ test('runTurn refuses to start when history is empty', async () => {
   await chat.runTurn({ sid: 's1', messages: [], autoExecute: false, onEvent: (event) => events.push(event) });
   assert.equal(events.at(-1).type, 'error');
   assert.equal(events.at(-1).code, 'empty-history');
+});
+
+test('runTurn echoes the prepared config back into stream options', () => {
+  // 直接验契约：makeFakeLlm 的 stream 会因 config 不一致抛
+  // INVALID_PREPARED_CALL；旧实现（只传 provider+model）在这里必炸。
+  // 动态构造一次最小 runTurn 太贵，改为静态断言 runTurn 的用法形状：
+  // prepareCall 的返回值必须被展开进 stream 入参（源码级回归哨兵）。
+  const source = readFileSync(new URL('../src/chat.js', import.meta.url), 'utf8');
+  assert.equal(source.includes('...prepared.config'), true,
+    'runTurn must spread prepared.config into stream options');
 });

@@ -534,8 +534,12 @@ export function createChatService(options = {}) {
         const prepared = await llm.prepareCall({ provider: picked.provider, model: picked.model });
         const result = await consumeStream(
           prepared.stream({
-            provider: picked.provider,
-            model: picked.model,
+            // 必须把 prepareCall 返回的 config 原样带回：runtime 在这里做
+            // callConfigEquals 校验（provider/model/reasoningEffort/
+            // temperature/maxTokens/stop），adapter 物化出的默认值（如
+            // GLM-5.3 的 reasoningEffort）不在入参里就抛
+            // INVALID_PREPARED_CALL（2026-10-24 真机实测）。
+            ...prepared.config,
             messages: history,
             system,
             tools: CHAT_TOOLS,

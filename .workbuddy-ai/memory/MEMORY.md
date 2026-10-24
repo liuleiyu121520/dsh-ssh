@@ -11,3 +11,11 @@
 - dsh monorepo（真包来源）：`/Users/leiyu/code/pre-study/deepseek-harness`（vendor/cordis、vendor/loader、packages/client/modules 等）。
 - macOS 是 BSD grep：`\|` 不是 alternation，要用 `grep -E`。
 - 仓库 2026-10-24 才 `git init`，8b39f7b 是 root commit，无"修复前"历史。
+
+## 对话助手（llm 服务）要点
+- 调模型：`ctx.get('llm')` → `listProviders()/listModels(p)/prepareCall({provider,model}).stream({provider,model,messages,system,tools,signal})`；stream 只能分发一次，每轮重新 prepareCall；options 的 provider/model 必须与 config 一致（callConfigEquals）。
+- 消息块运行时形状：text `{type:'text',text}`；assistant 工具调用 `{type:'tool-call',id,name,arguments}`；工具结果 `{role:'tool',toolCallId,content,isError}`；**assistant 必须带 `source:{kind:'model',provider,model}`**（runtime forAdapter 读 source.replayState）。
+- system 角色由 Host 每轮重建，客户端 history 里的 system 要丢弃。
+- marker 捕获输出：正则别要求行首是 \n（真终端是 \r）；超时发 \x03。
+- 用户机器的模型来源：profile 里装了 dsh-our-free-model（provider 路由 our-free-model / our-free-model-region，GLM 5.3 等免费模型）；patch 里 agent-default-model 是 zcode/GLM-5.3。
+- E2E：`E2E_PASSWORD=*** node scripts/chat-e2e.mjs`（真 ssh + 真 llm 包 + 假 adapter，12 断言）。

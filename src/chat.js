@@ -389,8 +389,12 @@ export async function executeInSession({ service, sid, command, timeoutMs }) {
   };
 
   try {
-    service.send(sid, `${command}\n`);
-    service.send(sid, `printf '%s %s\\n' '${marker}' "$?"\n`);
+    // 单行合成：`<command>; printf marker "$?"`——`;` 让 printf 紧跟命令，
+    // `$?` 即命令退出码。**不要拆成两次 send**：两行连发时 readline 偶尔
+    // 吞掉第二行的换行（bracketed paste 会话上的竞态，2026-10-24 E2E
+    // 连续复现），printf 永不执行 → 必超时。合成一行后整行是一个整体，
+    // shell 顺序执行，marker 天然是输出结束分界线。
+    service.send(sid, `${command}; printf '%s %s\\n' '${marker}' "$?"\n`);
   } catch (error) {
     unsubscribe();
     throw codedError('unknown-session', `session ${sid} cannot accept input: ${error.message}`);
@@ -411,6 +415,20 @@ export async function executeInSession({ service, sid, command, timeoutMs }) {
     const grace = Date.now() + ABORT_GRACE_MS;
     while (!done && Date.now() < grace) {
       await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    // 补救：Ctrl+C 后 shell 回到干净提示符，补发一次 marker 行把已经产生
+    // 的输出收干净（命令已被打断，rc 无意义；timedOut 已标记，输出完整
+    // 比 rc 更重要——超时也要让用户/模型看到前半段输出）。
+    if (!done) {
+      try {
+        service.send(sid, `printf '%s %s\\n' '${marker}' "$?"\n`);
+      } catch {
+        // 会话断了：放弃补救。
+      }
+      const rescue = Date.now() + 1000;
+      while (!done && Date.now() < rescue) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
     }
   }
   return finish();

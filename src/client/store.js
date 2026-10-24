@@ -632,9 +632,22 @@ function wireRuntime(rt) {
   rt.term.onResize(({ cols, rows }) => {
     void actions.postResize(rt.sid, cols, rows);
   });
-  rt.term.onFocus(() => {
+  // 聚焦上报：xterm 6.0 的**公开 API 移除了 onFocus**（内部 CoreBrowserTerminal
+  // 还有但没暴露，2026-10-24 真机实测：无条件调用会让每次打开会话都抛
+  // TypeError，整个视图被启动台错误边界兜成"此应用加载失败"）。特性检测 +
+  // textarea 的 DOM focus 事件兜底——聚焦只影响模型侧工具的默认目标会话，
+  // 丢不得，但更不能让视图崩。
+  const reportFocus = () => {
     void actions.postFocus(rt.sid);
-  });
+  };
+  if (typeof rt.term.onFocus === 'function') {
+    rt.term.onFocus(reportFocus);
+  } else {
+    const textarea = rt.term.textarea;
+    if (textarea !== undefined && textarea !== null && typeof textarea.addEventListener === 'function') {
+      textarea.addEventListener('focus', reportFocus);
+    }
+  }
 }
 
 /**

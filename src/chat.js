@@ -178,7 +178,14 @@ export function normalizeHistory(history, source = {}) {
     if (role === 'assistant') {
       // 只有 assistant 需要 source：真 runtime 的 forAdapter 只读 assistant 的
       // source.replayState，user/tool 消息的 source 没有消费者。
-      out.push({ role, content: normalizeContent(raw.content), source: origin });
+      // 客户端带回来的 replayState（思考签名）必须原样保留：续轮缺它，官方
+      // 通道会拒收（2026-10-24 真机：第一轮好使、续轮必挂）。
+      const replayState = raw.source !== null && typeof raw.source === 'object' ? raw.source.replayState : undefined;
+      out.push({
+        role,
+        content: normalizeContent(raw.content),
+        source: replayState === undefined ? origin : { ...origin, replayState },
+      });
       continue;
     }
     out.push({ role, content: normalizeContent(raw.content) });
@@ -210,6 +217,9 @@ function normalizeContent(content) {
     if (block === null || typeof block !== 'object') continue;
     if (block.type === 'text' && typeof block.text === 'string') {
       blocks.push({ type: 'text', text: block.text });
+    } else if (block.type === 'reasoning' && typeof block.text === 'string') {
+      // 思考块只作为签名载体回传（正文可以为空）。
+      blocks.push({ type: 'reasoning', text: block.text });
     } else if (
       block.type === 'tool-call' &&
       typeof block.name === 'string' &&
@@ -301,6 +311,8 @@ async function consumeStream(chunks, onEvent) {
   const toolCalls = [];
   let finishReason = 'stop';
   let finishFailure = null;
+  /** 原生 replay 元数据（思考签名）：续轮必须原样回传，否则官方通道拒收。 */
+  let replayState;
   for await (const chunk of chunks ?? []) {
     if (chunk === null || typeof chunk !== 'object') continue;
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
@@ -338,6 +350,7 @@ async function consumeStream(chunks, onEvent) {
       const finish = normalizeFinish(chunk.reason);
       finishReason = finish.kind;
       finishFailure = finish.failure;
+      if (chunk.replayState !== undefined) replayState = chunk.replayState;
     }
   }
   // delta 攒了但没等到 block-end 的（异常截断）：能救一个是一个。
@@ -346,7 +359,7 @@ async function consumeStream(chunks, onEvent) {
       toolCalls.push({ id: slot.id || `call-${randomBytes(6).toString('hex')}`, name: slot.name, arguments: slot.args || '{}' });
     }
   }
-  return { text, reasoning, toolCalls, finishReason, finishFailure };
+  return { text, reasoning, toolCalls, finishReason, finishFailure, replayState };
 }
 
 /**
@@ -824,14 +837,30 @@ export function createChatService(options = {}) {
             emit({ type: 'error', code: 'empty-response', message: `[${picked.provider} / ${picked.model}] 模型没有返回任何内容（可能当前不可用或触发了安全策略），请重试或切换模型` });
             return;
           }
-          emit({ type: 'finish', reason: 'stop' });
+          emit({
+            type: 'finish',
+            reason: 'stop',
+            ...result.replayState === undefined ? {} : { replayState: result.replayState },
+          });
           return;
         }
         // 只有 run_command 一个工具；别的名字按错误结果回给模型。
-        /** assistant 消息的来源标注：真 runtime 的 forAdapter 要读 source。 */
-        const modelSource = { kind: 'model', provider: picked.provider, model: picked.model };
+        /**
+         * assistant 消息的来源标注：真 runtime 的 forAdapter 要读 source，
+         * 而 `replayState`（思考签名）必须原样回传——思考型模型的多轮请求里，
+         * 带 tool_use 的 assistant 轮缺了 thinking 块会被官方通道直接拒掉
+         * （2026-10-24：第一轮好使、续轮必挂，就是这里丢了元数据）。
+         */
+        const modelSource = {
+          kind: 'model',
+          provider: picked.provider,
+          model: picked.model,
+          ...result.replayState === undefined ? {} : { replayState: result.replayState },
+        };
         /** @type {object[]} */
         const assistantBlocks = [];
+        // 与原生一致：思考块只作为签名载体，正文留空（签名才是服务端要的）。
+        if (result.replayState !== undefined) assistantBlocks.push({ type: 'reasoning', text: '' });
         if (result.text !== '') assistantBlocks.push({ type: 'text', text: result.text });
         for (const call of result.toolCalls) {
           assistantBlocks.push({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments });
@@ -875,7 +904,11 @@ export function createChatService(options = {}) {
           emit({ type: 'tool-result', id: call.id, ok: outcome.ok, output: outcome.preview, timedOut: outcome.timedOut === true });
         }
         if (paused === true) {
-          emit({ type: 'finish', reason: 'tool-call' });
+          emit({
+            type: 'finish',
+            reason: 'tool-call',
+            ...result.replayState === undefined ? {} : { replayState: result.replayState },
+          });
           return;
         }
       }

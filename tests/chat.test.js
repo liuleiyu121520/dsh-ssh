@@ -791,3 +791,51 @@ test('面板只重试 2 次，哪怕通道策略允许 5 次', async () => {
   assert.equal(events.filter((event) => event.type === 'retry').length, 2);
   assert.equal(events.at(-1).type, 'error');
 });
+
+// ── 思考签名（replayState）必须原样回传 ───────────────────────────────
+
+test('runTurn echoes replayState and a reasoning block into the next request', async () => {
+  // 原生 assistant 消息是 [{type:'reasoning',text:''}, {type:'text'}, …] +
+  // source.replayState（思考签名）。缺了它，官方通道的续轮会被拒——真机表现
+  // 就是"第一轮好使、后面必挂"（2026-10-24）。
+  const { service } = makeShellService(shellWith('ok'));
+  service.open({ host: LOCAL_HOST });
+  const replayState = {
+    response: { kind: 'deepseek-messages', version: 1, model: 'm1' },
+    blocks: [{ type: 'reasoning', signature: 'sig-1' }, { type: 'text' }],
+  };
+  /** 第二轮拿到的 messages，用来断言回传形状。 */
+  let seen = null;
+  let call = 0;
+  const llm = {
+    listProviders: () => [{ id: 'p1', name: 'P1' }],
+    listModels: async () => [{ id: 'm1', label: 'M1' }],
+    prepareCall: async (config) => ({
+      config: { provider: config.provider, model: config.model },
+      stream: (options) => {
+        call += 1;
+        if (call === 1) {
+          return (function* first() {
+            yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'c1', name: 'run_command', arguments: '{"command":"df -h"}' } };
+            yield { type: 'finish', reason: { kind: 'tool-calls' }, replayState };
+          })();
+        }
+        seen = options.messages;
+        return textRound();
+      },
+    }),
+  };
+  const chat = createChatService({ service, llm });
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '磁盘呢' }],
+    approval: 'auto',
+    provider: 'p1',
+    model: 'm1',
+    onEvent: () => {},
+  });
+  assert.ok(seen !== null, '第二轮应已发出');
+  const assistant = seen.find((message) => message.role === 'assistant');
+  assert.equal(assistant.content[0].type, 'reasoning', '思考块必须排第一位');
+  assert.deepEqual(assistant.source.replayState, replayState, '签名要原样回传');
+});

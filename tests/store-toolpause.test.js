@@ -53,7 +53,7 @@ const script = [
   [
     { type: 'model', provider: 'p1', model: 'm1' },
     { type: 'tool-call', id: 'c1', name: 'run_command', command: 'df -h /', arguments: '{"command":"df -h /"}', needsConfirm: true },
-    { type: 'finish', reason: 'tool-call' },
+    { type: 'finish', reason: 'tool-call', replayState: { response: { kind: 'deepseek-messages', version: 1, model: 'm1' }, blocks: [{ type: 'reasoning', signature: 'sig-1' }, { type: 'text' }, { type: 'tool-call' }] } },
   ],
   [
     { type: 'model', provider: 'p1', model: 'm1' },
@@ -118,6 +118,11 @@ test('回合因工具调用暂停后，点"执行"必须真的跑（不能卡在
   assert.ok(execCall !== undefined, '点执行必须真的请求 /chat/exec');
   const resumed = calls.filter((call) => call.url.endsWith('/api/dsh-ssh/chat'));
   assert.equal(resumed.length, 2, '执行完必须续跑一轮对话（第二次 POST /chat）');
+  // 续跑请求必须把思考签名与思考占位块带回去（否则官方通道拒收）。
+  const secondBody = JSON.parse(String(resumed[1].init.body));
+  const assistant = secondBody.messages.find((message) => message.role === 'assistant');
+  assert.equal(assistant.content[0].type, 'reasoning', '思考块要排第一位');
+  assert.equal(assistant.source.replayState.blocks[0].signature, 'sig-1');
 
   const done = getState().chats.s1;
   assert.equal(done.pending, false, '续跑结束应清掉暂停标记');

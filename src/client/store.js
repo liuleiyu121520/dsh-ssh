@@ -535,7 +535,7 @@ function patchCall(sid, callId, patch) {
  * @param {object[]} messages 视图模型消息。
  * @returns {object[]} llm history。
  */
-function buildChatHistory(messages) {
+function buildChatHistory(messages, picked = { provider: '', model: '' }) {
   /** @type {object[]} */
   const history = [];
   for (const message of messages) {
@@ -546,13 +546,23 @@ function buildChatHistory(messages) {
     if (message.kind !== 'turn') continue;
     /** @type {object[]} */
     const blocks = [];
+    // 思考块是签名载体：有 replayState 就必须把它放回第一位（顺序也是契约）。
+    if (message.replayState !== undefined) blocks.push({ type: 'reasoning', text: '' });
     if (typeof message.text === 'string' && message.text !== '') {
       blocks.push({ type: 'text', text: message.text });
     }
     for (const call of message.calls ?? []) {
       blocks.push({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments });
     }
-    if (blocks.length > 0) history.push({ role: 'assistant', content: blocks });
+    if (blocks.length > 0) {
+      history.push({
+        role: 'assistant',
+        content: blocks,
+        source: message.replayState === undefined
+          ? { kind: 'model', provider: picked.provider, model: picked.model }
+          : { kind: 'model', provider: picked.provider, model: picked.model, replayState: message.replayState },
+      });
+    }
     for (const call of message.calls ?? []) {
       if (call.resultContent === undefined) continue;
       history.push({
@@ -684,6 +694,7 @@ function handleChatEvent(sid, event) {
     // 单独记，否则输入区会一直显示"停止"、消息区一直显示"思考中"，而
     // resolveToolCall 开头的 streaming 守卫会把"执行"按钮也一起挡死。
     const awaiting = event.reason === 'tool-call';
+    const replayState = event.replayState === undefined ? undefined : event.replayState;
     // 这轮跑通了：把"调用失败"标记与回避记录撤掉——它现在能用了。否则下拉里
     // 会一直挂着"（调用失败）"，用户以为还坏着（2026-10-24 用户就是照这个
     // 标签来问"为什么我的 deepseek 会失败"）。
@@ -703,7 +714,7 @@ function handleChatEvent(sid, event) {
     const messages = chatOf(sid).messages.slice();
     const last = messages[messages.length - 1];
     if (last !== undefined && last.kind === 'turn' && last.streaming === true) {
-      messages[messages.length - 1] = { ...last, streaming: false };
+      messages[messages.length - 1] = { ...last, streaming: false, ...replayState === undefined ? {} : { replayState } };
       patchChat(sid, { messages, streaming: false, pending: awaiting, slow: false, retrying: null });
     } else {
       patchChat(sid, { streaming: false, pending: awaiting, slow: false, retrying: null });
@@ -761,7 +772,7 @@ async function runChatTurn(sid, options = {}) {
       headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
       body: JSON.stringify({
         sid,
-        messages: buildChatHistory(current.messages),
+        messages: buildChatHistory(current.messages, state.llm.picked),
         approval: state.chatApproval,
         provider: state.llm.picked.provider,
         model: state.llm.picked.model,

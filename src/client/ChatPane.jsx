@@ -404,6 +404,11 @@ function ChatMessages({ sid }) {
       {chat.streaming === true && chat.messages.every((message) => message.kind !== 'turn' || message.streaming !== true) ? (
         <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatThinking')}</div>
       ) : null}
+      {chat.retrying !== null && chat.streaming === true ? (
+        <div style={{ fontSize: '11px', lineHeight: '16px', color: 'var(--dsw-alias-label-quaternary)' }}>
+          {t('chatRetrying', { attempt: chat.retrying.attempt, max: chat.retrying.max ?? '…' })}
+        </div>
+      ) : null}
       {chat.slow === true && chat.streaming === true ? (
         <div style={{ fontSize: '11px', lineHeight: '16px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatSlow')}</div>
       ) : null}

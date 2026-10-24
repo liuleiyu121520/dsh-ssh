@@ -515,3 +515,101 @@ test('runTurn skips the model inventory when the client already picked a model',
   assert.deepEqual(events.map((event) => event.type), ['accepted', 'model', 'text', 'finish']);
   assert.deepEqual(events[1], { type: 'model', provider: 'p1', model: 'm1' });
 });
+
+// ── 通道级失败：按 adapter 的 retryPolicy 退避重试 ──────────────────────
+
+/** 一次 transport 失败（首字节之前）。 */
+function* transportFailure() {
+  yield {
+    type: 'finish',
+    reason: { kind: 'error', failure: { message: 'DeepSeek Messages transport failed', code: 'TRANSPORT' } },
+  };
+}
+
+/** 先吐半句再失败（不该重试）。 */
+function* partialThenTransport() {
+  yield { type: 'text-delta', index: 0, text: '根分区' };
+  yield {
+    type: 'finish',
+    reason: { kind: 'error', failure: { message: 'DeepSeek Messages transport failed', code: 'TRANSPORT' } },
+  };
+}
+
+/**
+ * 造一个带 retryPolicy 的假 llm：按剧本逐次返回，并记录 prepareCall 次数。
+ * @param {Array<() => AsyncIterable<object>>} rounds 每次尝试的剧本。
+ * @returns {object} 假 llm。
+ */
+function makeRetryingLlm(rounds) {
+  let call = 0;
+  return {
+    attempts: () => call,
+    listProviders: () => [{ id: 'p1', name: 'P1' }],
+    listModels: async () => [{ id: 'm1', label: 'M1' }],
+    prepareCall: async (config) => {
+      const round = rounds[Math.min(call, rounds.length - 1)];
+      call += 1;
+      return {
+        config: { provider: config.provider, model: config.model },
+        // 与真 adapter 的 providerRetryPolicy() 同形。
+        retryPolicy: {
+          mode: 'normal',
+          maxRetries: 2,
+          retryableCodes: ['EMPTY_RESPONSE', 'SERVER', 'TIMEOUT', 'TRANSPORT'],
+          initialDelayMs: 1,
+          maxDelayMs: 2,
+          jitterRatio: 0,
+        },
+        stream: () => round(),
+      };
+    },
+  };
+}
+
+test('runTurn retries a transport failure before the first byte, then succeeds', async () => {
+  // 原生对话有 dsh-llm-retry 兜住这种抖动；我们的面板以前一次就报错，
+  // 于是同一条通道"原生能答、右栏 transport failed"。
+  const { service } = makeShellService(shellWith('x'));
+  service.open({ host: LOCAL_HOST });
+  const llm = makeRetryingLlm([transportFailure, textRound]);
+  const chat = createChatService({ service, llm });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '磁盘呢' }],
+    autoExecute: false,
+    provider: 'p1',
+    model: 'm1',
+    onEvent: (event) => events.push(event),
+  });
+  const types = events.map((event) => event.type);
+  assert.equal(types.includes('retry'), true, '抖动时应先发 retry 事件');
+  assert.equal(types.includes('error'), false, '重试成功就不该报错');
+  assert.equal(events.at(-1).type, 'finish');
+  assert.equal(llm.attempts(), 2, '一共两次尝试（首跑 + 一次重试）');
+  const retry = events.find((event) => event.type === 'retry');
+  assert.equal(retry.code, 'TRANSPORT');
+  assert.equal(retry.maxRetries, 2);
+});
+
+test('runTurn does not retry once text has been emitted', async () => {
+  // 已经吐了正文再重试 = 同一段话重复一遍，用户看到的是乱码式重复。
+  const { service } = makeShellService(shellWith('x'));
+  service.open({ host: LOCAL_HOST });
+  const llm = makeRetryingLlm([partialThenTransport, textRound]);
+  const chat = createChatService({ service, llm });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '磁盘呢' }],
+    autoExecute: false,
+    provider: 'p1',
+    model: 'm1',
+    onEvent: (event) => events.push(event),
+  });
+  assert.equal(events.some((event) => event.type === 'retry'), false);
+  assert.equal(events.at(-1).type, 'error');
+  assert.equal(llm.attempts(), 1, '不该有第二次尝试');
+});

@@ -68,6 +68,9 @@ function frames(events) {
   });
 }
 
+/** /chat 被调用了几次（1 = 首次，2 = 换通道后的自动重发）。 */
+let chatCalls = 0;
+
 globalThis.fetch = async (url) => {
   const target = String(url);
   if (target.includes('/api/dsh-ssh/hosts')) {
@@ -89,14 +92,28 @@ globalThis.fetch = async (url) => {
     };
   }
   if (target.includes('/api/dsh-ssh/chat')) {
-    // 真机上的那一帧：transport failed，带通道前缀。
+    chatCalls += 1;
+    // 第一次：真机上的那一帧（transport failed，带通道前缀）。
+    if (chatCalls === 1) {
+      return {
+        ok: true,
+        status: 200,
+        body: frames([
+          { type: 'accepted' },
+          { type: 'model', provider: 'deepseek-account', model: 'deepseek-flash' },
+          { type: 'error', code: 'TRANSPORT', message: '[deepseek-account / deepseek-flash] DeepSeek Messages transport failed' },
+        ]),
+      };
+    }
+    // 第二次（换通道后的自动重发）：新通道正常回答。
     return {
       ok: true,
       status: 200,
       body: frames([
         { type: 'accepted' },
-        { type: 'model', provider: 'deepseek-account', model: 'deepseek-flash' },
-        { type: 'error', code: 'TRANSPORT', message: '[deepseek-account / deepseek-flash] DeepSeek Messages transport failed' },
+        { type: 'model', provider: 'our-free-model', model: 'z-ai/glm-5.3' },
+        { type: 'text', text: 'nginx 站点在 /etc/nginx/conf.d。' },
+        { type: 'finish', reason: 'stop' },
       ]),
     };
   }
@@ -125,8 +142,11 @@ test('通道调用失败后必须切到另一个通道，并记住别再选它',
   assert.deepEqual(JSON.parse(disk.get('dsh-ssh:chatAvoid')), ['deepseek-account']);
   // 用户要被告知"已经换过了，重发一次"。
   assert.ok(after.toast !== null && String(after.toast.text).includes('z-ai/glm-5.3'), `应有切换提示，实际：${JSON.stringify(after.toast)}`);
-  // 错误本身照旧展示，方便排障。
-  assert.match(after.chats.s1.error, /transport failed/);
+  // 换通道后自动重发：用户不用手动再发一次，红字也不该留在气泡里。
+  assert.equal(chatCalls, 2, '换通道后必须自动重发一次');
+  assert.equal(after.chats.s1.error, null, '重发成功后错误条要消失');
+  const answer = after.chats.s1.messages.at(-1);
+  assert.match(String(answer.text), /nginx/, '重发要真的拿到新通道的回答');
 });
 
 test('重新挂载时不会把回避表里的通道恢复成默认', async () => {

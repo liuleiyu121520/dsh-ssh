@@ -408,7 +408,7 @@ const WATCHDOG_HARD_MS = 180000;
  * @returns {object} 对话状态。
  */
 function chatOf(sid) {
-  return state.chats[sid] ?? { messages: [], streaming: false, pending: false, slow: false, error: null };
+  return state.chats[sid] ?? { messages: [], streaming: false, pending: false, slow: false, retrying: null, error: null };
 }
 
 /**
@@ -601,11 +601,18 @@ function handleChatEvent(sid, event) {
     setState({ llm: { ...state.llm, picked: { provider: event.provider, model: event.model } } });
     return;
   }
+  if (event?.type === 'retry') {
+    // 通道抖动，Host 正在退避重试：让用户看到"还在动"，而不是又一段空白。
+    patchChat(sid, { retrying: { attempt: Number(event.attempt) || 1, max: Number.isInteger(event.maxRetries) ? event.maxRetries : null } });
+    return;
+  }
   if (event?.type === 'reasoning' && typeof event.text === 'string') {
+    patchChat(sid, { retrying: null });
     appendTurnReasoning(sid, event.text);
     return;
   }
   if (event?.type === 'text' && typeof event.text === 'string') {
+    patchChat(sid, { retrying: null });
     appendTurnText(sid, event.text);
     return;
   }
@@ -623,7 +630,7 @@ function handleChatEvent(sid, event) {
     return;
   }
   if (event?.type === 'error') {
-    patchChat(sid, { streaming: false, pending: false, slow: false, error: typeof event.message === 'string' ? event.message : 'unknown error' });
+    patchChat(sid, { streaming: false, pending: false, slow: false, retrying: null, error: typeof event.message === 'string' ? event.message : 'unknown error' });
     // 模型级失败：把**刚失败的那个通道**记进回避表，再挑一个不同的健康通道
     // 顶上——否则 localStorage 里的坏选择会把用户钉死在同一个错误上，而
     // "挑第一个可用通道"在没有 unavailable 标记时恰好又会挑回它自己
@@ -635,15 +642,27 @@ function handleChatEvent(sid, event) {
       const failed = state.llm.picked.provider;
       rememberAvoid(failed);
       const healthy = pickHealthy(state.llm.providers, avoidProviders);
-      if (healthy.provider !== '' && healthy.provider !== failed) {
-        setState({ llm: { ...state.llm, picked: healthy } });
+      // 候选本身也在回避表里 = 没有别的通道可选（pickHealthy 的最后一级会
+      // 把坏通道还回来）。这时候切过去只会在两个坏通道之间来回弹，不如
+      // 原地报错让用户自己决定。
+      if (healthy.provider !== '' && healthy.provider !== failed && avoidProviders.includes(healthy.provider) === false) {
+        // 让下拉也能看出"这条通道刚炸过"：标上不可用（仍可手动选回）。
+        setState({
+          llm: {
+            ...state.llm,
+            picked: healthy,
+            providers: state.llm.providers.map((row) => (row.id === failed ? { ...row, unavailable: '调用失败' } : row)),
+          },
+        });
         try {
           localStorage.setItem(LS_MODEL, JSON.stringify(healthy));
         } catch {
           // 忽略。
         }
         actions.showToast(t('chatAutoSwitched', { model: healthy.model }));
-      } else if (healthy.provider === '') {
+        return 'channel-switched';
+      }
+      if (healthy.provider === '') {
         // 一个能用的都没有：别装作切过了，明说。
         actions.showToast(t('chatNoHealthy'));
       }
@@ -662,23 +681,40 @@ function handleChatEvent(sid, event) {
     const last = messages[messages.length - 1];
     if (last !== undefined && last.kind === 'turn' && last.streaming === true) {
       messages[messages.length - 1] = { ...last, streaming: false };
-      patchChat(sid, { messages, streaming: false, pending: awaiting, slow: false });
+      patchChat(sid, { messages, streaming: false, pending: awaiting, slow: false, retrying: null });
     } else {
-      patchChat(sid, { streaming: false, pending: awaiting, slow: false });
+      patchChat(sid, { streaming: false, pending: awaiting, slow: false, retrying: null });
     }
   }
 }
 
 /**
+ * 这一轮是否"什么都没产出"（没有正文、没有命令卡）。
+ *
+ * 只有这种情况才适合换通道后自动重发：已经有内容时重发，模型看到的是
+ * "自己说过的话"，会接着写而不是重新回答，反而更乱。
+ * @param {string} sid 会话 id。
+ * @returns {boolean} 没产出返回 true。
+ */
+function producedNothing(sid) {
+  const last = chatOf(sid).messages.at(-1);
+  if (last === undefined || last.kind !== 'turn') return true;
+  const hasText = typeof last.text === 'string' && last.text !== '';
+  const hasCalls = Array.isArray(last.calls) && last.calls.length > 0;
+  return hasText === false && hasCalls === false;
+}
+
+/**
  * 跑一个对话回合：POST /chat 收 SSE，事件落进 state.chats[sid]。
  * @param {string} sid 会话 id。
+ * @param {{retried?: boolean}} [options] retried=true 表示这是通道切换后的自动重发。
  * @returns {Promise<void>}
  */
-async function runChatTurn(sid) {
+async function runChatTurn(sid, options = {}) {
   const current = chatOf(sid);
   if (chatAbort !== null) return; // 同一会话只允许一个在途回合
   chatAbort = new AbortController();
-  patchChat(sid, { streaming: true, pending: false, slow: false, error: null });
+  patchChat(sid, { streaming: true, pending: false, slow: false, retrying: null, error: null });
   // 看门狗：60s 没事件只提示"还在等"，180s 才断开。
   // 为什么不是 60s 直接掐：思考型模型单是思考就可能超过 60s，且部分通道
   // 在首个正文前会把 reasoning 整个缓冲住（一个事件都不吐）。60s 硬掐等于
@@ -720,13 +756,24 @@ async function runChatTurn(sid) {
       patchChat(sid, { streaming: false, error: message });
       return;
     }
+    let switched = false;
     await readChatStream(response, (event) => {
       chatLastEventAt = Date.now();
       // 有动静就把"还在等"的提示撤掉（reasoning 增量也算动静）。
       if (chatOf(sid).slow === true) patchChat(sid, { slow: false });
-      handleChatEvent(sid, event);
+      if (handleChatEvent(sid, event) === 'channel-switched') switched = true;
     });
     patchChat(sid, { streaming: false });
+    // 通道级失败换了通道：**自动重发一次**，别让用户为一次通道故障手动重发
+    // （2026-10-24 真机：切换其实成功了，但红字留在气泡里，用户以为还是不行）。
+    // 只在"这一轮什么都没产出"时重发：已经有正文/命令卡的话，重发会让模型
+    // 接着写而不是重答，反而更乱。
+    if (switched === true && options.retried !== true && producedNothing(sid) === true) {
+      clearInterval(watchdog);
+      chatAbort = null;
+      await runChatTurn(sid, { retried: true });
+      return;
+    }
   } catch (error) {
     if (watchdogFired === true) {
       patchChat(sid, { streaming: false, pending: false, slow: false, error: t('chatWatchdog') });

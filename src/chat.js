@@ -38,6 +38,8 @@ const MAX_OUTPUT_CHARS = 6000;
 const MAX_PREVIEW_CHARS = 1200;
 /** 单轮请求里最大的"模型轮"数（含工具续跑），防无限循环。 */
 const MAX_TOOL_ROUNDS = 6;
+/** 一次模型调用的重试硬上限（'always' 策略也不会超过它）。 */
+const HARD_MAX_RETRIES = 6;
 /** 默认命令超时（毫秒）与硬上限。 */
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TIMEOUT_MS = 120000;
@@ -445,6 +447,58 @@ export async function executeInSession({ service, sid, command, timeoutMs }) {
 }
 
 /**
+ * 这次失败是否该按 provider 的 retryPolicy 重试。
+ *
+ * 形状取自 `ResolvedRetryPolicy`（dsh-llm/retry-policy）：normal 模式只重试
+ * retryableCodes 里的稳定错误码，always 模式重试一切。缺策略就当不重试。
+ * @param {object|undefined} policy prepared.retryPolicy。
+ * @param {{code?: string}|null|undefined} failure finish 里的 failure。
+ * @param {number} attempt 已经重试过的次数（从 0 起）。
+ * @returns {boolean} 是否重试。
+ */
+function retryable(policy, failure, attempt) {
+  if (policy === undefined || policy === null) return false;
+  // 自带硬上限：'always' 模式在 runtime 里是"重试到成功或取消"，但面板是
+  // 一个会一直转的前端，通道彻底挂了不能无限重试（每次重试事件都会重置
+  // 客户端的看门狗，等于永远不超时）。
+  if (attempt >= HARD_MAX_RETRIES) return false;
+  if (policy.mode === 'always') return true;
+  if (policy.mode !== 'normal') return false;
+  if (Number.isInteger(policy.maxRetries) && attempt >= policy.maxRetries) return false;
+  const code = typeof failure?.code === 'string' ? failure.code : '';
+  return Array.isArray(policy.retryableCodes) && policy.retryableCodes.includes(code);
+}
+
+/**
+ * 指数退避 + 对称抖动（与 runtime 的算法同义，避免多实例同时重试打爆通道）。
+ * @param {object|undefined} policy prepared.retryPolicy。
+ * @param {number} attempt 已经重试过的次数（从 0 起）。
+ * @returns {number} 延迟毫秒。
+ */
+function backoffDelay(policy, attempt) {
+  const initial = Number.isFinite(policy?.initialDelayMs) ? policy.initialDelayMs : 500;
+  const ceiling = Number.isFinite(policy?.maxDelayMs) ? policy.maxDelayMs : 10000;
+  const jitter = Number.isFinite(policy?.jitterRatio) ? policy.jitterRatio : 0.1;
+  const base = Math.min(initial * 2 ** attempt, ceiling);
+  const factor = 1 + (Math.random() * 2 - 1) * jitter;
+  return Math.max(0, Math.round(base * factor));
+}
+
+/**
+ * 可被取消的等待：用户点"停止"时立刻返回，不把回合拖在退避里。
+ * @param {number} ms 毫秒。
+ * @param {AbortSignal} [signal] 取消信号。
+ * @returns {Promise<void>} 等待结束。
+ */
+async function sleep(ms, signal) {
+  if (signal?.aborted === true) return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
+/**
  * 造对话服务。
  * @param {object} options 参数。
  * @param {object} options.service SshSessionService（会话 + 终端缓冲）。
@@ -629,14 +683,13 @@ export function createChatService(options = {}) {
 
       /** 客户端记住的通道可能已经不存在（插件升级/改名）：只回退一次。 */
       let fellBack = false;
-      for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-        if (signal?.aborted === true) {
-          emit({ type: 'finish', reason: 'aborted' });
-          return;
-        }
-        let prepared;
+      /**
+       * 取一次 prepared call；通道/模型已不存在时回退一次清单里的健康通道。
+       * @returns {Promise<object>} prepared call。
+       */
+      const prepareOnce = async () => {
         try {
-          prepared = await llm.prepareCall({ provider: picked.provider, model: picked.model });
+          return await llm.prepareCall({ provider: picked.provider, model: picked.model });
         } catch (error) {
           // 通道/模型已不存在（旧的 localStorage 选择最常见）：回退到清单里
           // 第一个健康通道重试一次，别让一个过期选择把用户钉死在错误上。
@@ -647,23 +700,56 @@ export function createChatService(options = {}) {
           if (fallback === null) throw error;
           picked = fallback;
           emit({ type: 'model', provider: picked.provider, model: picked.model });
-          prepared = await llm.prepareCall({ provider: picked.provider, model: picked.model });
+          return llm.prepareCall({ provider: picked.provider, model: picked.model });
         }
-        const result = await consumeStream(
-          prepared.stream({
-            // 必须把 prepareCall 返回的 config 原样带回：runtime 在这里做
-            // callConfigEquals 校验（provider/model/reasoningEffort/
-            // temperature/maxTokens/stop），adapter 物化出的默认值（如
-            // GLM-5.3 的 reasoningEffort）不在入参里就抛
-            // INVALID_PREPARED_CALL（2026-10-24 真机实测）。
-            ...prepared.config,
-            messages: history,
-            system,
-            tools: CHAT_TOOLS,
-            signal,
-          }),
-          emit,
-        );
+      };
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+        if (signal?.aborted === true) {
+          emit({ type: 'finish', reason: 'aborted' });
+          return;
+        }
+        let prepared;
+        let result;
+        // 通道级瞬时失败（TRANSPORT/TIMEOUT/SERVER…）按 adapter 自带的
+        // retryPolicy 退避重试。**这一层以前完全没有**，而原生对话有
+        // （dsh-llm-retry 挂在 agent loop 的失败钩子上）：同一条通道偶发抖动，
+        // 原生悄悄重试两次就好了，我们一次就报错——这才是"原生能答、右栏
+        // transport failed"的真正差别（2026-10-24 真机）。
+        for (let attempt = 0; ; attempt += 1) {
+          prepared = await prepareOnce();
+          result = await consumeStream(
+            prepared.stream({
+              // 必须把 prepareCall 返回的 config 原样带回：runtime 在这里做
+              // callConfigEquals 校验（provider/model/reasoningEffort/
+              // temperature/maxTokens/stop），adapter 物化出的默认值（如
+              // GLM-5.3 的 reasoningEffort）不在入参里就抛
+              // INVALID_PREPARED_CALL（2026-10-24 真机实测）。
+              ...prepared.config,
+              messages: history,
+              system,
+              tools: CHAT_TOOLS,
+              signal,
+            }),
+            emit,
+          );
+          if (result.finishReason !== 'error') break;
+          // 已经吐出正文/命令卡就不重试：重试会把同一段话再说一遍，用户看到
+          // 的是重复内容。通道级失败几乎都发生在首字节之前。
+          const untouched = result.text === '' && result.toolCalls.length === 0;
+          const policy = prepared.retryPolicy;
+          if (untouched !== true || retryable(policy, result.finishFailure, attempt) !== true) break;
+          const delayMs = backoffDelay(policy, attempt);
+          emit({
+            type: 'retry',
+            attempt: attempt + 1,
+            maxRetries: policy.mode === 'always' ? null : policy.maxRetries,
+            delayMs,
+            code: typeof result.finishFailure?.code === 'string' ? result.finishFailure.code : '',
+          });
+          logger(`chat: retrying after ${result.finishFailure?.code ?? 'error'} in ${delayMs}ms (attempt ${attempt + 1})`);
+          await sleep(delayMs, signal);
+          if (signal?.aborted === true) break;
+        }
         if (result.toolCalls.length === 0 || result.finishReason === 'error') {
           if (result.finishReason === 'error') {
             // 真 adapter 的失败信息在 finish.failure 里（{message, code}）——

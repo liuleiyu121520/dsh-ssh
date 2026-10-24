@@ -500,7 +500,10 @@ function ChatControls() {
         }}
       >
         {llm.providers.map((provider) => (
-          <optgroup key={provider.id} label={provider.name}>
+          <optgroup
+            key={provider.id}
+            label={provider.unavailable !== undefined ? `${provider.name}（${provider.unavailable}）` : provider.name}
+          >
             {(provider.models ?? []).map((model) => (
               <option key={`${provider.id}::${model.id}`} value={`${provider.id}::${model.id}`}>
                 {model.label !== '' ? model.label : model.id}

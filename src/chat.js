@@ -451,9 +451,30 @@ export function createChatService(options = {}) {
   const llm = options.llm ?? null;
   const config = options.config ?? {};
   const logger = typeof options.logger === 'function' ? options.logger : () => {};
+  /**
+   * 惰性取宿主的 DeepSeek 账号服务（deepseekAccount，读登录态用）。
+   * 不进 inject（铁律：可选服务缺失会让 fiber 永远 pending），每次用时解析。
+   * @returns {object|undefined} deepseekAccount 服务或 undefined。
+   */
+  const account = typeof options.account === 'function' ? options.account : () => undefined;
   const contextLines = Number.isInteger(config.maxContextLines) && config.maxContextLines > 0 ? config.maxContextLines : DEFAULT_CONTEXT_LINES;
   const defaultProvider = typeof config.provider === 'string' && config.provider !== '' ? config.provider : '';
   const defaultModel = typeof config.model === 'string' && config.model !== '' ? config.model : '';
+
+  /**
+   * 探测宿主 DeepSeek 账号登录态。
+   * @returns {Promise<string|undefined>} 'signed-out' | 'credential-stored' | undefined（服务缺位/失败）。
+   */
+  const probeAccount = async () => {
+    const service = account();
+    if (service === undefined || service === null || typeof service.getState !== 'function') return undefined;
+    try {
+      const view = await service.getState();
+      return typeof view?.status === 'string' ? view.status : undefined;
+    } catch {
+      return undefined; // 探测失败不标记：宁可让用户看到真实调用错误
+    }
+  };
 
   /**
    * 模型可用性 + 可选清单（UI 下拉用）。
@@ -490,6 +511,15 @@ export function createChatService(options = {}) {
     if (providers.length === 0) {
       return { available: false, providers: [], default: { provider: '', model: '' }, reason: 'no-provider' };
     }
+    // 登录态过滤：deepseek-account 未登录时其模型清单只是内置目录（无远程
+    // listing），调用必失败——账号服务缺位/探测失败时不做任何标记（能力
+    // 探测绝不能把正常路径打挂）。
+    const status = await probeAccount();
+    if (status === 'signed-out') {
+      for (const row of providers) {
+        if (row.id === 'deepseek-account') row.unavailable = 'DeepSeek 未登录';
+      }
+    }
     return { available: true, providers, default: { provider: defaultProvider, model: defaultModel } };
   };
 
@@ -512,6 +542,12 @@ export function createChatService(options = {}) {
       const model = configured.models.find((row) => row.id === defaultModel) ?? configured.models[0] ?? null;
       if (model !== null) return { provider: configured.id, model: model.id };
     }
+    for (const row of providers) {
+      if (row.unavailable !== undefined) continue; // 未登录等已知不可用：默认挑选跳过
+      const model = row.models[0] ?? null;
+      if (model !== null) return { provider: row.id, model: model.id };
+    }
+    // 全都不可用：退而求其次，别让用户一个模型都选不到。
     for (const row of providers) {
       const model = row.models[0] ?? null;
       if (model !== null) return { provider: row.id, model: model.id };
@@ -590,7 +626,8 @@ export function createChatService(options = {}) {
         if (result.toolCalls.length === 0 || result.finishReason === 'error') {
           if (result.finishReason === 'error') {
             // 真 adapter 的失败信息在 finish.failure 里（{message, code}）——
-            // 吞掉它用户只会看到"没反应"。
+            // 吞掉它用户只会看到"没反应"。附上失败的通道与模型，用户能
+            // 自己判断该换哪个（如未登录的 DeepSeek 官方通道）。
             const failure = result.finishFailure;
             const message = typeof failure?.message === 'string' && failure.message !== ''
               ? failure.message
@@ -598,7 +635,7 @@ export function createChatService(options = {}) {
             emit({
               type: 'error',
               code: typeof failure?.code === 'string' ? failure.code : 'llm-error',
-              message,
+              message: `[${picked.provider} / ${picked.model}] ${message}`,
             });
             return;
           }
@@ -608,7 +645,7 @@ export function createChatService(options = {}) {
           }
           if (result.text === '') {
             // 零文本零工具的空响应：必须出声，否则用户以为面板卡死。
-            emit({ type: 'error', code: 'empty-response', message: '模型没有返回任何内容（可能当前不可用或触发了安全策略），请重试或切换模型' });
+            emit({ type: 'error', code: 'empty-response', message: `[${picked.provider} / ${picked.model}] 模型没有返回任何内容（可能当前不可用或触发了安全策略），请重试或切换模型` });
             return;
           }
           emit({ type: 'finish', reason: 'stop' });

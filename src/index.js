@@ -271,7 +271,15 @@ export async function apply(ctx, config = {}) {
     // context store，两者在不同作用域可见性不同——只用一个曾让真机上
     // 对话服务拿到 null（2026-10-24 复现实测）。
     const llm = scoped.llm ?? (typeof scoped.get === 'function' ? scoped.get('llm') : undefined);
-    state.chat = createChatService({ service, llm: llm ?? null, config: chatConfig, logger });
+    state.chat = createChatService({
+      service,
+      llm: llm ?? null,
+      config: chatConfig,
+      logger,
+      // 惰性解析 DeepSeek 账号服务（读登录态，给未登录通道打标记）。
+      // 不声明进 inject——可选服务缺失不能让对话半层 pending（铁律）。
+      account: () => ctx.get('deepseekAccount'),
+    });
     logger(`chat half mounted${llm === undefined || llm === null ? ' (llm missing, degraded)' : ''}`);
     return () => {
       state.chat = null;

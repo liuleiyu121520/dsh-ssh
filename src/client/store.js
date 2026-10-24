@@ -298,14 +298,26 @@ const runtimes = new Map();
 const LS_MODEL = 'dsh-ssh:chatModel';
 
 /**
- * 从清单里挑第一个"已知可用"（未打 unavailable 标记）的 provider + 首个模型。
- * 全部不可用时退回第一个有模型的（让用户至少能试，错误会原样透出）。
+ * 从清单里挑第一个"已知可用"（未打 unavailable 标记、且不在回避表里）的
+ * provider + 首个模型。
+ *
+ * `avoid` 是本次会话里**刚刚调用失败**的通道：不过滤掉它，"自动切换"会把
+ * 用户从坏通道切到同一个坏通道——表现就是报错后模型下拉纹丝不动、也没有
+ * 任何提示（2026-10-24 真机：DeepSeek 官方通道 transport failed 后一直卡在
+ * 同一通道，而第一个 provider 恰好就是它）。
+ *
+ * 层层退让：可用且未回避 → 未回避 → 全部。最后一级是"实在没得选，让用户
+ * 至少能试，错误会原样透出"。
  * @param {object[]} providers 模型清单。
- * @returns {{provider: string, model: string}} 选择结果。
+ * @param {string[]} [avoid] 需要回避的 provider id。
+ * @returns {{provider: string, model: string}} 选择结果；无可选时两个字段皆空。
  */
-function pickHealthy(providers) {
-  const usable = (providers ?? []).filter((row) => row.unavailable === undefined);
-  const pool = usable.length > 0 ? usable : (providers ?? []);
+function pickHealthy(providers, avoid = []) {
+  const rows = providers ?? [];
+  const avoided = new Set(avoid);
+  const usable = rows.filter((row) => row.unavailable === undefined && avoided.has(row.id) === false);
+  const notAvoided = rows.filter((row) => avoided.has(row.id) === false);
+  const pool = usable.length > 0 ? usable : (notAvoided.length > 0 ? notAvoided : rows);
   for (const row of pool) {
     const model = (row.models ?? [])[0] ?? null;
     if (model !== null) return { provider: row.id, model: model.id };
@@ -313,6 +325,58 @@ function pickHealthy(providers) {
   return { provider: '', model: '' };
 }
 const LS_AUTO_EXEC = 'dsh-ssh:chatAutoExec';
+
+/** localStorage 键：调用失败过的通道（重启后也别再自动选它）。 */
+const LS_AVOID = 'dsh-ssh:chatAvoid';
+/** 回避表上限：够覆盖这台机器的通道数，又不会无限长。 */
+const MAX_AVOID = 8;
+
+/**
+ * 读取回避表。坏数据一律当空表——这个表只影响"默认选谁"，绝不能让它
+ * 把右栏打崩。
+ * @returns {string[]} provider id 列表。
+ */
+function loadAvoid() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LS_AVOID) ?? '[]');
+    return Array.isArray(raw) ? raw.filter((id) => typeof id === 'string' && id !== '') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 本次会话的回避表（localStorage 是持久层，这里是内存副本）。 */
+let avoidProviders = loadAvoid();
+
+/**
+ * 记一个"调用失败"的通道并持久化。
+ * @param {string} provider provider id。
+ * @returns {void}
+ */
+function rememberAvoid(provider) {
+  if (provider === '') return;
+  avoidProviders = [...avoidProviders.filter((id) => id !== provider), provider].slice(-MAX_AVOID);
+  try {
+    localStorage.setItem(LS_AVOID, JSON.stringify(avoidProviders));
+  } catch {
+    // 隐私模式：内存副本照旧生效，只是重启后忘掉。
+  }
+}
+
+/**
+ * 忘掉一个通道的失败记录（用户手动选了它，就是"我愿意再试"）。
+ * @param {string} provider provider id。
+ * @returns {void}
+ */
+function forgetAvoid(provider) {
+  if (avoidProviders.includes(provider) === false) return;
+  avoidProviders = avoidProviders.filter((id) => id !== provider);
+  try {
+    localStorage.setItem(LS_AVOID, JSON.stringify(avoidProviders));
+  } catch {
+    // 忽略。
+  }
+}
 
 /** 进行中的对话请求的 AbortController（"停止"按钮用）。 */
 let chatAbort = null;
@@ -560,14 +624,18 @@ function handleChatEvent(sid, event) {
   }
   if (event?.type === 'error') {
     patchChat(sid, { streaming: false, pending: false, slow: false, error: typeof event.message === 'string' ? event.message : 'unknown error' });
-    // 模型级失败：自动把选择切到第一个健康通道并清掉本地记忆——
-    // 否则 localStorage 里的坏选择会把用户钉死在同一个错误上。
+    // 模型级失败：把**刚失败的那个通道**记进回避表，再挑一个不同的健康通道
+    // 顶上——否则 localStorage 里的坏选择会把用户钉死在同一个错误上，而
+    // "挑第一个可用通道"在没有 unavailable 标记时恰好又会挑回它自己
+    // （2026-10-24 真机：DeepSeek 官方通道 transport failed 后下拉纹丝不动）。
     // 会话级错误（会话没了/历史为空）不在此列，与模型无关。
     const sessionLevel = new Set(['unknown-session', 'empty-history', 'chat-unavailable']);
     const code = typeof event.code === 'string' ? event.code : '';
     if (sessionLevel.has(code) === false) {
-      const healthy = pickHealthy(state.llm.providers);
-      if (healthy.provider !== '' && (healthy.provider !== state.llm.picked.provider || healthy.model !== state.llm.picked.model)) {
+      const failed = state.llm.picked.provider;
+      rememberAvoid(failed);
+      const healthy = pickHealthy(state.llm.providers, avoidProviders);
+      if (healthy.provider !== '' && healthy.provider !== failed) {
         setState({ llm: { ...state.llm, picked: healthy } });
         try {
           localStorage.setItem(LS_MODEL, JSON.stringify(healthy));
@@ -575,6 +643,9 @@ function handleChatEvent(sid, event) {
           // 忽略。
         }
         actions.showToast(t('chatAutoSwitched', { model: healthy.model }));
+      } else if (healthy.provider === '') {
+        // 一个能用的都没有：别装作切过了，明说。
+        actions.showToast(t('chatNoHealthy'));
       }
     }
     return;
@@ -1281,17 +1352,21 @@ export const actions = {
       }
       const known = providers.find((row) => row.id === picked.provider);
       // 本地记住的选择若落在"已知不可用"的通道上（如未登录的 DeepSeek 官方
-      // 通道），视同无效——否则每次启动都被钉死在坏通道上（2026-10-24 真机）。
+      // 通道）或**刚调用失败过**的通道上，视同无效——否则每次启动都被钉死在
+      // 坏通道上（2026-10-24 真机）。
       const knownUsable = known !== undefined
         && known.unavailable === undefined
+        && avoidProviders.includes(known.id) === false
         && (known.models ?? []).some((model) => model.id === picked.model);
       if (!knownUsable) {
         const configuredRaw = providers.find((row) => row.id === data.default?.provider);
-        const configured = configuredRaw?.unavailable !== undefined ? undefined : configuredRaw;
+        const configured = configuredRaw?.unavailable !== undefined || avoidProviders.includes(configuredRaw?.id ?? '')
+          ? undefined
+          : configuredRaw;
         const fromConfig = configured?.models?.find((model) => model.id === data.default?.model) ?? configured?.models?.[0] ?? null;
         picked = fromConfig !== null && configured !== undefined
           ? { provider: configured.id, model: fromConfig.id }
-          : pickHealthy(providers);
+          : pickHealthy(providers, avoidProviders);
       }
       setState({ llm: { status: 'ready', providers, picked } });
     } catch {
@@ -1306,6 +1381,8 @@ export const actions = {
    * @returns {void}
    */
   setChatModel(provider, model) {
+    // 用户手动选的通道就是"我愿意再试"：把它从回避表里放出来。
+    forgetAvoid(provider);
     setState({ llm: { ...state.llm, picked: { provider, model } } });
     try {
       localStorage.setItem(LS_MODEL, JSON.stringify({ provider, model }));

@@ -673,10 +673,15 @@ export function createChatService(options = {}) {
             const message = typeof failure?.message === 'string' && failure.message !== ''
               ? failure.message
               : '模型调用失败，请重试或切换模型';
+            // status / requestId 是排障的唯一线索（"transport failed" 本身
+            // 不含原因）：有就带上，没有不强编。
+            const facts = [];
+            if (Number.isInteger(failure?.status)) facts.push(`HTTP ${failure.status}`);
+            if (typeof failure?.requestId === 'string' && failure.requestId !== '') facts.push(`req ${failure.requestId}`);
             emit({
               type: 'error',
               code: typeof failure?.code === 'string' ? failure.code : 'llm-error',
-              message: `[${picked.provider} / ${picked.model}] ${message}`,
+              message: `[${picked.provider} / ${picked.model}] ${message}${facts.length === 0 ? '' : `（${facts.join('，')}）`}`,
             });
             return;
           }

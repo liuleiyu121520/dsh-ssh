@@ -267,8 +267,10 @@ export async function apply(ctx, config = {}) {
   // chat-unavailable、/llm 回 {available:false}，UI 显示"未配置模型"——
   // 终端本身永远可用（设计 §2.1 的分层降级）。
   const chatHalf = ctx.inject(['llm'], (scoped = ctx) => {
-    // 用非抛访问器取服务：声明过 inject 也走 get，形状不符时不炸 apply。
-    const llm = typeof scoped.get === 'function' ? scoped.get('llm') : undefined;
+    // 双保险取服务（与持久化半同一姿势）：属性访问走 fiber 链，get() 走
+    // context store，两者在不同作用域可见性不同——只用一个曾让真机上
+    // 对话服务拿到 null（2026-10-24 复现实测）。
+    const llm = scoped.llm ?? (typeof scoped.get === 'function' ? scoped.get('llm') : undefined);
     state.chat = createChatService({ service, llm: llm ?? null, config: chatConfig, logger });
     logger(`chat half mounted${llm === undefined || llm === null ? ' (llm missing, degraded)' : ''}`);
     return () => {

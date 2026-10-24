@@ -233,13 +233,32 @@ function buildSystemPrompt({ session, tail, autoExecute }) {
 }
 
 /**
+ * 归一 finish reason。
+ *
+ * 真契约是**对象** `{kind:'stop'|'tool-calls'|'error'|'aborted'|'max-tokens',
+ * failure?: {message, code}}`（dsh-llm types.ts 的 FinishReasonMap）。字符串
+ * 形状是曾经的错误假设——真 adapter（dsh-our-free-model）全发对象，按字符串
+ * 解析会把 error 静默吞成 stop，用户侧表现为"输入了没反应"
+ * （2026-10-24 真机实测）。字符串仅作兼容保留。
+ * @param {unknown} reason finish chunk 的 reason 字段。
+ * @returns {{kind: string, failure: object|null}} 归一结果。
+ */
+function normalizeFinish(reason) {
+  if (typeof reason === 'string') return { kind: reason, failure: null };
+  if (reason !== null && typeof reason === 'object' && typeof reason.kind === 'string') {
+    return { kind: reason.kind, failure: reason.failure ?? null };
+  }
+  return { kind: 'stop', failure: null };
+}
+
+/**
  * 从 stream chunk 流里攒一个回合的结果。
  *
  * 文本增量立刻经 onEvent 吐出去（SSE 流式）；工具调用块在 block-end 时
  * 成块收齐（arguments 是完整 JSON 字符串）。
  * @param {AsyncIterable<object>} chunks llm stream。
  * @param {(event: object) => void} onEvent 事件回调。
- * @returns {Promise<{text: string, toolCalls: object[], finishReason: string}>} 回合结果。
+ * @returns {Promise<{text: string, toolCalls: object[], finishReason: string, finishFailure: object|null}>} 回合结果。
  */
 async function consumeStream(chunks, onEvent) {
   let text = '';
@@ -248,6 +267,7 @@ async function consumeStream(chunks, onEvent) {
   /** @type {object[]} */
   const toolCalls = [];
   let finishReason = 'stop';
+  let finishFailure = null;
   for await (const chunk of chunks ?? []) {
     if (chunk === null || typeof chunk !== 'object') continue;
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
@@ -272,8 +292,10 @@ async function consumeStream(chunks, onEvent) {
       if (call.id !== '' && call.name !== '') toolCalls.push(call);
       continue;
     }
-    if (chunk.type === 'finish' && typeof chunk.reason === 'string') {
-      finishReason = chunk.reason;
+    if (chunk.type === 'finish') {
+      const finish = normalizeFinish(chunk.reason);
+      finishReason = finish.kind;
+      finishFailure = finish.failure;
     }
   }
   // delta 攒了但没等到 block-end 的（异常截断）：能救一个是一个。
@@ -282,7 +304,7 @@ async function consumeStream(chunks, onEvent) {
       toolCalls.push({ id: slot.id || `call-${randomBytes(6).toString('hex')}`, name: slot.name, arguments: slot.args || '{}' });
     }
   }
-  return { text, toolCalls, finishReason };
+  return { text, toolCalls, finishReason, finishFailure };
 }
 
 /**
@@ -549,7 +571,26 @@ export function createChatService(options = {}) {
         );
         if (result.toolCalls.length === 0 || result.finishReason === 'error') {
           if (result.finishReason === 'error') {
-            emit({ type: 'error', code: 'llm-error', message: '模型调用失败，请重试或切换模型' });
+            // 真 adapter 的失败信息在 finish.failure 里（{message, code}）——
+            // 吞掉它用户只会看到"没反应"。
+            const failure = result.finishFailure;
+            const message = typeof failure?.message === 'string' && failure.message !== ''
+              ? failure.message
+              : '模型调用失败，请重试或切换模型';
+            emit({
+              type: 'error',
+              code: typeof failure?.code === 'string' ? failure.code : 'llm-error',
+              message,
+            });
+            return;
+          }
+          if (result.finishReason === 'aborted') {
+            emit({ type: 'finish', reason: 'aborted' });
+            return;
+          }
+          if (result.text === '') {
+            // 零文本零工具的空响应：必须出声，否则用户以为面板卡死。
+            emit({ type: 'error', code: 'empty-response', message: '模型没有返回任何内容（可能当前不可用或触发了安全策略），请重试或切换模型' });
             return;
           }
           emit({ type: 'finish', reason: 'stop' });

@@ -93,7 +93,7 @@ function makeFakeLlm(rounds, providers = [{ id: 'p1', name: 'P1' }], models = [{
 /** 文本收尾轮。 */
 function* textRound() {
   yield { type: 'text-delta', index: 0, text: '磁盘还有一半空间' };
-  yield { type: 'finish', reason: 'stop' };
+  yield { type: 'finish', reason: { kind: 'stop' } };
 }
 
 /** 工具调用轮（run_command df -h）。 */
@@ -111,7 +111,24 @@ function* toolRound() {
     index: 1,
     block: { type: 'tool-call', id: 'call-1', name: 'run_command', arguments: '{"command":"df -h"}' },
   };
-  yield { type: 'finish', reason: 'tool_calls' };
+  yield { type: 'finish', reason: { kind: 'tool-calls' } };
+}
+
+/** 错误收尾轮：真 adapter 的失败形状（对象 reason + failure）。 */
+function* errorRound() {
+  yield { type: 'text-delta', index: 0, text: '半句话' };
+  yield {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: { message: 'our free model does not serve "glm-5.3" on this egress', code: 'SERVER' },
+    },
+  };
+}
+
+/** 空响应轮：只有 finish，没有任何文本/工具（模型不可用时的静默形态）。 */
+function* emptyRound() {
+  yield { type: 'finish', reason: { kind: 'stop' } };
 }
 
 // ── 纯函数 ────────────────────────────────────────────────────────────
@@ -342,6 +359,42 @@ test('runTurn refuses to start when history is empty', async () => {
   await chat.runTurn({ sid: 's1', messages: [], autoExecute: false, onEvent: (event) => events.push(event) });
   assert.equal(events.at(-1).type, 'error');
   assert.equal(events.at(-1).code, 'empty-history');
+});
+
+test('runTurn surfaces the adapter failure message from an error finish', async () => {
+  // 真 adapter 的 finish 是对象 {kind:'error', failure:{message, code}}；按字符串
+  // 解析会把错误吞成 stop，用户看到"没反应"（2026-10-24 真机实测）。
+  const { service } = makeShellService(shellWith('x'));
+  service.open({ host: LOCAL_HOST });
+  const chat = createChatService({ service, llm: makeFakeLlm([errorRound]) });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '你好' }],
+    autoExecute: false,
+    onEvent: (event) => events.push(event),
+  });
+  assert.deepEqual(events.map((event) => event.type), ['model', 'text', 'error']);
+  const error = events.at(-1);
+  assert.equal(error.code, 'SERVER');
+  assert.match(error.message, /does not serve "glm-5.3"/);
+});
+
+test('runTurn reports an empty model response instead of staying silent', async () => {
+  const { service } = makeShellService(shellWith('x'));
+  service.open({ host: LOCAL_HOST });
+  const chat = createChatService({ service, llm: makeFakeLlm([emptyRound]) });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '你好' }],
+    autoExecute: false,
+    onEvent: (event) => events.push(event),
+  });
+  assert.deepEqual(events.map((event) => event.type), ['model', 'error']);
+  assert.equal(events.at(-1).code, 'empty-response');
 });
 
 test('runTurn echoes the prepared config back into stream options', () => {

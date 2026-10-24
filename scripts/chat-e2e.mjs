@@ -118,12 +118,12 @@ const script = [
     yield { type: 'text-delta', index: 0, text: '先看看根分区：' };
     yield { type: 'tool-call-delta', index: 1, id: 'e2e-call-1', name: 'run_command', argumentsDelta: '{"command":"df -h /"}' };
     yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'e2e-call-1', name: 'run_command', arguments: '{"command":"df -h /"}' } };
-    yield { type: 'finish', reason: 'tool_calls' };
+    yield { type: 'finish', reason: { kind: 'tool-calls' } };
   },
   // 第二轮：拿到工具结果后的文本收尾。
   async function* round2() {
     yield { type: 'text-delta', index: 0, text: '根分区上面就是这些，结论自己看。' };
-    yield { type: 'finish', reason: 'stop' };
+    yield { type: 'finish', reason: { kind: 'stop' } };
   },
 ];
 
@@ -284,6 +284,24 @@ async function main() {
     check('未知 provider 回退到 e2e/e2e-model',
       turn3[0]?.type === 'model' && turn3[0]?.provider === 'e2e' && turn3[0]?.model === 'e2e-model',
       JSON.stringify(turn3[0]));
+
+    // 7) 错误 finish 必须透出（对象 reason + failure），不能吞成静默 stop。
+    fakeAdapter.calls = script.length; // 越界后固定用最后一个剧本
+    script.push(async function* errorRound() {
+      yield { type: 'text-delta', index: 0, text: '半句话' };
+      yield {
+        type: 'finish',
+        reason: { kind: 'error', failure: { message: 'e2e injected upstream failure', code: 'SERVER' } },
+      };
+    });
+    const turn4 = await readSse(`${base}/chat`, {
+      method: 'POST',
+      body: JSON.stringify({ sid, autoExecute: false, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const errorEvent = turn4.find((event) => event.type === 'error');
+    check('错误 finish 透出为 error 事件且带原文',
+      errorEvent?.code === 'SERVER' && String(errorEvent?.message).includes('e2e injected upstream failure'),
+      JSON.stringify(turn4.map((event) => event.type)));
   } finally {
     try {
       await dispose();

@@ -42,6 +42,15 @@ const MAX_TOOL_ROUNDS = 6;
 /** 一次模型调用的重试硬上限（'always' 策略也不会超过它）。 */
 const HARD_MAX_RETRIES = 6;
 /**
+ * 面板自己的重试次数上限：**比通道策略更保守**。
+ *
+ * 通道的 retryPolicy 是给 agent loop 用的（后台跑、用户不在等）；右栏是有人
+ * 盯着的前端，同一个确定性失败重试 5 次只是让用户干等 20 秒（DeepSeek 官方
+ * 通道的默认策略就是 5 次）。面板只试 2 次：抖动基本都在这两次里恢复，恢复
+ * 不了就换通道 + 自动重发。
+ */
+const PANEL_MAX_RETRIES = 2;
+/**
  * 授权三档：
  * - `auto`   命令直接执行；
  * - `danger` 只拦危险命令（rm -rf / 重启 / 停服务…，见 src/danger.js）；
@@ -483,9 +492,10 @@ function retryable(policy, failure, attempt) {
   // 一个会一直转的前端，通道彻底挂了不能无限重试（每次重试事件都会重置
   // 客户端的看门狗，等于永远不超时）。
   if (attempt >= HARD_MAX_RETRIES) return false;
-  if (policy.mode === 'always') return true;
+  if (policy.mode === 'always') return attempt < PANEL_MAX_RETRIES;
   if (policy.mode !== 'normal') return false;
-  if (Number.isInteger(policy.maxRetries) && attempt >= policy.maxRetries) return false;
+  const limit = Number.isInteger(policy.maxRetries) ? Math.min(policy.maxRetries, PANEL_MAX_RETRIES) : PANEL_MAX_RETRIES;
+  if (attempt >= limit) return false;
   const code = typeof failure?.code === 'string' ? failure.code : '';
   return Array.isArray(policy.retryableCodes) && policy.retryableCodes.includes(code);
 }

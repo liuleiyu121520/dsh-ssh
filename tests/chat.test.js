@@ -757,3 +757,37 @@ test('老客户端只发 autoExecute 布尔值时按 auto/always 兼容', async 
   });
   assert.equal(events.find((event) => event.type === 'tool-call').needsConfirm, true);
 });
+
+test('面板只重试 2 次，哪怕通道策略允许 5 次', async () => {
+  // 通道的 retryPolicy 是给后台 agent loop 的（maxRetries 5）；右栏有人在等，
+  // 同一个确定性失败重试 5 次只是让用户干等。恢复不了就换通道 + 自动重发。
+  const { service } = makeShellService(shellWith('x'));
+  service.open({ host: LOCAL_HOST });
+  let attempts = 0;
+  const llm = {
+    listProviders: () => [{ id: 'p1', name: 'P1' }],
+    listModels: async () => [{ id: 'm1', label: 'M1' }],
+    prepareCall: async (config) => {
+      attempts += 1;
+      return {
+        config: { provider: config.provider, model: config.model },
+        retryPolicy: { mode: 'normal', maxRetries: 5, retryableCodes: ['TRANSPORT'], initialDelayMs: 1, maxDelayMs: 1, jitterRatio: 0 },
+        stream: () => transportFailure(),
+      };
+    },
+  };
+  const chat = createChatService({ service, llm });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: 'hi' }],
+    approval: 'auto',
+    provider: 'p1',
+    model: 'm1',
+    onEvent: (event) => events.push(event),
+  });
+  assert.equal(attempts, 3, '首次 + 2 次重试，不能按通道的 5 次跑');
+  assert.equal(events.filter((event) => event.type === 'retry').length, 2);
+  assert.equal(events.at(-1).type, 'error');
+});

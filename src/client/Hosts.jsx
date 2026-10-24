@@ -80,10 +80,13 @@ const actionButtonStyle = {
 
 /**
  * 一行主机（含 hover 操作与删除二次确认）。
- * @param {{host: object, active: boolean, gap: object|null, onSelect: (host: object) => void, onOpenTab: (hostId: string) => void, onEdit: (host: object) => void, onDelete: (host: object) => void}} props 行数据。
+ *
+ * 交互（2026-10-24 用户要求）：单击只选中高亮（已有会话则聚焦其标签），
+ * **双击才发起连接**——避免进应用就顺手连上。
+ * @param {{host: object, active: boolean, selected: boolean, gap: object|null, onSelect: (host: object) => void, onOpenTab: (hostId: string) => void, onEdit: (host: object) => void, onDelete: (host: object) => void}} props 行数据。
  * @returns {JSX.Element} 主机行。
  */
-function HostRow({ host, active, gap, onSelect, onOpenTab, onEdit, onDelete }) {
+function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onEdit, onDelete }) {
   const [hover, setHover] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const color = LIGHT_COLORS[host.status] ?? LIGHT_COLORS.offline;
@@ -91,6 +94,7 @@ function HostRow({ host, active, gap, onSelect, onOpenTab, onEdit, onDelete }) {
   const subtitle = `${host.host}:${host.port} · ${t(STATUS_KEYS[host.status] ?? 'statusOffline')}${
     gap !== null && gap !== undefined ? ` · ${t('replayGap')}` : ''
   }`;
+  const highlight = active || selected;
 
   return (
     <div
@@ -99,7 +103,7 @@ function HostRow({ host, active, gap, onSelect, onOpenTab, onEdit, onDelete }) {
       style={{
         margin: '1px 0',
         borderRadius: '8px',
-        background: active
+        background: highlight
           ? 'var(--dsw-alias-interactive-bg-active)'
           : hover
             ? 'var(--dsw-alias-bg-layer-3)'
@@ -110,7 +114,8 @@ function HostRow({ host, active, gap, onSelect, onOpenTab, onEdit, onDelete }) {
         <button
           type="button"
           onClick={() => onSelect(host)}
-          title={`${host.username === '' ? '(no user)' : host.username}@${host.host}:${host.port}`}
+          onDoubleClick={() => onOpenTab(host.id)}
+          title={`${host.username === '' ? '(no user)' : host.username}@${host.host}:${host.port}（双击连接）`}
           style={{
             flex: '1 1 auto',
             minWidth: 0,
@@ -246,7 +251,7 @@ function HostRow({ host, active, gap, onSelect, onOpenTab, onEdit, onDelete }) {
  * @param {{hosts: object[], activeSid: string|null, gaps?: object, onSelect: (host: object) => void, onAdd: () => void, onOpenTab: (hostId: string) => void, onEdit: (host: object) => void, onDelete: (host: object) => void}} props 组件参数。
  * @returns {JSX.Element} 左栏。
  */
-export function Hosts({ hosts, activeSid, gaps = {}, onSelect, onAdd, onOpenTab, onEdit, onDelete }) {
+export function Hosts({ hosts, activeSid, gaps = {}, selectedHostId = null, onSelect, onAdd, onOpenTab, onEdit, onDelete, onCollapse }) {
   return (
     <aside
       style={{
@@ -259,16 +264,43 @@ export function Hosts({ hosts, activeSid, gaps = {}, onSelect, onAdd, onOpenTab,
         background: 'var(--dsw-alias-bg-base)',
       }}
     >
-      <div
-        style={{
-          padding: '12px 14px 8px',
-          fontSize: '12px',
-          fontWeight: 600,
-          letterSpacing: '0.04em',
-          color: 'var(--dsw-alias-label-tertiary)',
-        }}
-      >
-        {t('hosts')}
+      <div style={{ display: 'flex', alignItems: 'center', paddingLeft: '14px', paddingRight: '8px', paddingTop: '12px', paddingBottom: '8px' }}>
+        <span
+          style={{
+            flex: '1 1 auto',
+            fontSize: '12px',
+            fontWeight: 600,
+            letterSpacing: '0.04em',
+            color: 'var(--dsw-alias-label-tertiary)',
+          }}
+        >
+          {t('hosts')}
+        </span>
+        {onCollapse !== undefined ? (
+          <button
+            type="button"
+            onClick={onCollapse}
+            title={t('hostsCollapse')}
+            aria-label={t('hostsCollapse')}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '22px',
+              height: '22px',
+              padding: 0,
+              border: 0,
+              borderRadius: '5px',
+              cursor: 'pointer',
+              color: 'var(--dsw-alias-label-quaternary)',
+              background: 'transparent',
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M15 6l-6 6 6 6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        ) : null}
       </div>
       <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto', padding: '0 6px' }}>
         {hosts.length === 0 ? (
@@ -279,6 +311,7 @@ export function Hosts({ hosts, activeSid, gaps = {}, onSelect, onAdd, onOpenTab,
               key={host.id}
               host={host}
               active={host.sid !== null && host.sid === activeSid}
+              selected={host.id === selectedHostId}
               gap={host.sid === null ? null : (gaps[host.sid] ?? null)}
               onSelect={onSelect}
               onOpenTab={onOpenTab}
@@ -312,6 +345,51 @@ export function Hosts({ hosts, activeSid, gaps = {}, onSelect, onAdd, onOpenTab,
           {t('addHost')}
         </button>
       </div>
+    </aside>
+  );
+}
+
+/**
+ * 左栏收起后的展开条（与右栏 ChatToggle 同款交互）。
+ * @returns {JSX.Element} 窄条。
+ */
+export function HostsToggle({ onExpand }) {
+  return (
+    <aside
+      style={{
+        width: '36px',
+        flex: '0 0 auto',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        paddingTop: '10px',
+        borderRight: '0.5px solid var(--dsw-alias-border-l2)',
+        background: 'var(--dsw-alias-bg-base)',
+      }}
+    >
+      <button
+        type="button"
+        onClick={onExpand}
+        title={t('hostsExpand')}
+        aria-label={t('hostsExpand')}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: '24px',
+          height: '24px',
+          padding: 0,
+          border: 0,
+          borderRadius: '5px',
+          cursor: 'pointer',
+          color: 'var(--dsw-alias-label-tertiary)',
+          background: 'transparent',
+        }}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
     </aside>
   );
 }

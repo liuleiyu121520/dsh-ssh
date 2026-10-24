@@ -73,6 +73,10 @@ let state = {
   llm: { status: 'idle', providers: [], picked: { provider: '', model: '' } },
   /** 自动执行开关（命令不经确认直接跑）；持久化在 localStorage。 */
   chatAutoExec: false,
+  /** 左栏主机列表是否收起。 */
+  hostsCollapsed: false,
+  /** 左栏当前高亮的主机 id（单击只选中，双击才连接）。 */
+  selectedHostId: null,
 };
 
 /** @type {Set<() => void>} */
@@ -292,10 +296,30 @@ const runtimes = new Map();
 
 /** localStorage 键：模型选择与自动执行开关。 */
 const LS_MODEL = 'dsh-ssh:chatModel';
+
+/**
+ * 从清单里挑第一个"已知可用"（未打 unavailable 标记）的 provider + 首个模型。
+ * 全部不可用时退回第一个有模型的（让用户至少能试，错误会原样透出）。
+ * @param {object[]} providers 模型清单。
+ * @returns {{provider: string, model: string}} 选择结果。
+ */
+function pickHealthy(providers) {
+  const usable = (providers ?? []).filter((row) => row.unavailable === undefined);
+  const pool = usable.length > 0 ? usable : (providers ?? []);
+  for (const row of pool) {
+    const model = (row.models ?? [])[0] ?? null;
+    if (model !== null) return { provider: row.id, model: model.id };
+  }
+  return { provider: '', model: '' };
+}
 const LS_AUTO_EXEC = 'dsh-ssh:chatAutoExec';
 
 /** 进行中的对话请求的 AbortController（"停止"按钮用）。 */
 let chatAbort = null;
+/** 最近一次对话事件的时间戳（看门狗用）。 */
+let chatLastEventAt = 0;
+/** 看门狗阈值：60s 无事件视为模型通道挂死。 */
+const WATCHDOG_MS = 60000;
 
 /**
  * 取（或懒建）一个会话的对话状态。
@@ -490,6 +514,23 @@ function handleChatEvent(sid, event) {
   }
   if (event?.type === 'error') {
     patchChat(sid, { streaming: false, error: typeof event.message === 'string' ? event.message : 'unknown error' });
+    // 模型级失败：自动把选择切到第一个健康通道并清掉本地记忆——
+    // 否则 localStorage 里的坏选择会把用户钉死在同一个错误上。
+    // 会话级错误（会话没了/历史为空）不在此列，与模型无关。
+    const sessionLevel = new Set(['unknown-session', 'empty-history', 'chat-unavailable']);
+    const code = typeof event.code === 'string' ? event.code : '';
+    if (sessionLevel.has(code) === false) {
+      const healthy = pickHealthy(state.llm.providers);
+      if (healthy.provider !== '' && (healthy.provider !== state.llm.picked.provider || healthy.model !== state.llm.picked.model)) {
+        setState({ llm: { ...state.llm, picked: healthy } });
+        try {
+          localStorage.setItem(LS_MODEL, JSON.stringify(healthy));
+        } catch {
+          // 忽略。
+        }
+        actions.showToast(t('chatAutoSwitched', { model: healthy.model }));
+      }
+    }
     return;
   }
   if (event?.type === 'finish') {
@@ -516,6 +557,18 @@ async function runChatTurn(sid) {
   if (chatAbort !== null) return; // 同一会话只允许一个在途回合
   chatAbort = new AbortController();
   patchChat(sid, { streaming: true, error: null });
+  // 看门狗：60s 无任何事件（含 model/tool-call 心跳类）→ 主动断开。
+  // runtime 对 TRANSPORT 类失败会内部重试（退避可达几十秒），不设看门狗
+  // 用户会停在"思考中"很久（2026-10-24 真机实测）。
+  chatLastEventAt = Date.now();
+  let watchdogFired = false;
+  const controller = chatAbort;
+  const watchdog = setInterval(() => {
+    if (Date.now() - chatLastEventAt > WATCHDOG_MS) {
+      watchdogFired = true;
+      controller.abort();
+    }
+  }, 5000);
   try {
     const response = await fetch(`${API}/chat`, {
       method: 'POST',
@@ -527,7 +580,7 @@ async function runChatTurn(sid) {
         provider: state.llm.picked.provider,
         model: state.llm.picked.model,
       }),
-      signal: chatAbort.signal,
+      signal: controller.signal,
     });
     if (!response.ok) {
       let message = `HTTP ${response.status}`;
@@ -540,12 +593,20 @@ async function runChatTurn(sid) {
       patchChat(sid, { streaming: false, error: message });
       return;
     }
-    await readChatStream(response, (event) => handleChatEvent(sid, event));
+    await readChatStream(response, (event) => {
+      chatLastEventAt = Date.now();
+      handleChatEvent(sid, event);
+    });
     patchChat(sid, { streaming: false });
   } catch (error) {
-    // AbortError 是用户点"停止"：静默收尾，不当成错误展示。
-    patchChat(sid, { streaming: false, error: error?.name === 'AbortError' ? null : (error?.message ?? String(error)) });
+    if (watchdogFired === true) {
+      patchChat(sid, { streaming: false, error: t('chatWatchdog') });
+    } else {
+      // AbortError 是用户点"停止"：静默收尾，不当成错误展示。
+      patchChat(sid, { streaming: false, error: error?.name === 'AbortError' ? null : (error?.message ?? String(error)) });
+    }
   } finally {
+    clearInterval(watchdog);
     chatAbort = null;
   }
 }
@@ -1156,12 +1217,18 @@ export const actions = {
         // localStorage 不可用/脏数据：按默认走。
       }
       const known = providers.find((row) => row.id === picked.provider);
-      if (known === undefined || !(known.models ?? []).some((model) => model.id === picked.model)) {
-        const configured = providers.find((row) => row.id === data.default?.provider);
+      // 本地记住的选择若落在"已知不可用"的通道上（如未登录的 DeepSeek 官方
+      // 通道），视同无效——否则每次启动都被钉死在坏通道上（2026-10-24 真机）。
+      const knownUsable = known !== undefined
+        && known.unavailable === undefined
+        && (known.models ?? []).some((model) => model.id === picked.model);
+      if (!knownUsable) {
+        const configuredRaw = providers.find((row) => row.id === data.default?.provider);
+        const configured = configuredRaw?.unavailable !== undefined ? undefined : configuredRaw;
         const fromConfig = configured?.models?.find((model) => model.id === data.default?.model) ?? configured?.models?.[0] ?? null;
         picked = fromConfig !== null && configured !== undefined
           ? { provider: configured.id, model: fromConfig.id }
-          : { provider: providers[0]?.id ?? '', model: providers[0]?.models?.[0]?.id ?? '' };
+          : pickHealthy(providers);
       }
       setState({ llm: { status: 'ready', providers, picked } });
     } catch {
@@ -1298,6 +1365,23 @@ export const actions = {
    */
   stopChat() {
     if (chatAbort !== null) chatAbort.abort();
+  },
+
+  /**
+   * 折叠 / 展开左栏主机列表。
+   * @returns {void}
+   */
+  toggleHosts() {
+    setState({ hostsCollapsed: state.hostsCollapsed !== true });
+  },
+
+  /**
+   * 单击主机：只选中高亮，不发起连接（连接走双击或「+ 标签」按钮）。
+   * @param {string} hostId 主机 id。
+   * @returns {void}
+   */
+  selectHost(hostId) {
+    setState({ selectedHostId: hostId });
   },
 
   /**

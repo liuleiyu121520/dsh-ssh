@@ -111,6 +111,10 @@ export const zh = {
   chatError: '出错了：{message}',
   chatUserSkipped: '用户跳过了这条命令的执行',
   chatSuggestHint: '试试这些：',
+  chatAutoSwitched: '模型调用失败，已自动切换到：{model}，请重新发送',
+  chatWatchdog: '等待模型响应超时（60 秒无响应），请重试或切换模型',
+  hostsCollapse: '收起主机列表',
+  hostsExpand: '展开主机列表',
 
   // ── 错误提示（按设计 §7.3 的错误码）──
   errorInvalidHost: '主机信息不合法，请检查地址、端口与用户名',
@@ -229,6 +233,10 @@ export const en = {
   chatError: 'Error: {message}',
   chatUserSkipped: 'User skipped this command',
   chatSuggestHint: 'Try:',
+  chatAutoSwitched: 'Model call failed, switched to: {model}. Please send again',
+  chatWatchdog: 'Timed out waiting for the model (no response for 60s). Retry or switch models',
+  hostsCollapse: 'Collapse hosts',
+  hostsExpand: 'Expand hosts',
 
   // Errors (design §7.3 codes)
   errorInvalidHost: 'Invalid host: check address, port and username',

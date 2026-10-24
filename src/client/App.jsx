@@ -10,7 +10,7 @@
  */
 import React, { useCallback, useEffect, useSyncExternalStore } from 'react';
 import { actions, getState, subscribe } from './store.js';
-import { Hosts } from './Hosts.jsx';
+import { Hosts, HostsToggle } from './Hosts.jsx';
 import { Tabs } from './Tabs.jsx';
 import { Terminal } from './Terminal.jsx';
 import { ChatPane, ChatToggle } from './ChatPane.jsx';
@@ -43,14 +43,28 @@ export function SshAppView({ active: _active = true } = {}) {
    * @param {object} host HostView。
    * @returns {void}
    */
+  /**
+   * 单击主机：只选中高亮；已有会话则聚焦其标签（不新开连接）。
+   * 连接走双击（handleOpenTab）——2026-10-24 用户要求"进应用不自动连"。
+   * @param {object} host HostView。
+   * @returns {void}
+   */
   const handleSelect = useCallback((host) => {
+    actions.selectHost(host?.id ?? '');
     const sid = host?.sid ?? null;
-    if (sid === null) {
-      void actions.openSession(host?.id ?? '');
-      return;
+    if (sid !== null) {
+      actions.ensureTab(sid);
+      actions.setActiveSid(sid);
     }
-    actions.ensureTab(sid);
-    actions.setActiveSid(sid);
+  }, []);
+
+  /**
+   * 双击主机 / 点「+ 标签」：连接（已有会话则聚焦，没有就新开）。
+   * @param {string} hostId Host id。
+   * @returns {void}
+   */
+  const handleOpenTab = useCallback((hostId) => {
+    void actions.openSession(hostId);
   }, []);
 
   const handleCloseTab = useCallback((sid) => {
@@ -59,10 +73,6 @@ export function SshAppView({ active: _active = true } = {}) {
 
   const handleNewTab = useCallback(() => {
     void actions.openNewTab();
-  }, []);
-
-  const handleOpenTab = useCallback((hostId) => {
-    void actions.openSession(hostId);
   }, []);
 
   const handleEdit = useCallback((host) => {
@@ -91,16 +101,22 @@ export function SshAppView({ active: _active = true } = {}) {
         background: 'var(--dsw-alias-bg-base)',
       }}
     >
-      <Hosts
-        hosts={state.hosts}
-        activeSid={state.activeSid}
-        gaps={state.gaps}
-        onSelect={handleSelect}
-        onAdd={handleAdd}
-        onOpenTab={handleOpenTab}
-        onEdit={handleEdit}
-        onDelete={handleDelete}
-      />
+      {state.hostsCollapsed ? (
+        <HostsToggle onExpand={actions.toggleHosts} />
+      ) : (
+        <Hosts
+          hosts={state.hosts}
+          activeSid={state.activeSid}
+          gaps={state.gaps}
+          selectedHostId={state.selectedHostId}
+          onSelect={handleSelect}
+          onAdd={handleAdd}
+          onOpenTab={handleOpenTab}
+          onEdit={handleEdit}
+          onDelete={handleDelete}
+          onCollapse={actions.toggleHosts}
+        />
+      )}
       <main style={{ flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         <Tabs
           tabs={state.tabs}

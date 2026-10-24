@@ -1,9 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
-  <!-- Identity: a terminal prompt sitting inside a host frame — "a shell on
-       a remote machine". The frame is the host, the ">_" is the prompt the
-       user actually types into. currentColor so the launchpad tile can tint
-       it per theme. -->
-  <rect x="2.5" y="3.5" width="19" height="17" rx="3" stroke="currentColor" stroke-width="1.8"/>
-  <path d="M7 9.5 10.5 12 7 14.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M12.5 15H17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Identity: a terminal prompt inside a blue tile — "a shell on a remote
+       machine". Fixed brand colors (blue gradient + white glyph) so it reads
+       the same as the built-in plugin artwork: the host renders this file as
+       an <img> inside a 40/48px frame, so it must carry its own fill instead
+       of riding currentColor (which left it a grey outline on a dark tile). -->
+  <rect x="4" y="6" width="28" height="24" rx="7" fill="url(#ssh-tile)"/>
+  <path d="M11.5 13.2 17 18 11.5 22.8" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M19.2 22.8H24.8" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+  <defs>
+    <linearGradient id="ssh-tile" x1="6" y1="7" x2="30" y2="29" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6FB2EE"/>
+      <stop offset="1" stop-color="#3E58D6"/>
+    </linearGradient>
+  </defs>
 </svg>

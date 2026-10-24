@@ -1,22 +1,30 @@
 /**
- * 图标：全部 24x24、currentColor、无外部引用。
+ * 图标：小控件图标全部 24x24、currentColor；只有应用图标 SshIcon 例外。
  *
- * 启动台卡片用 SshIcon（与包内 icon.svg 同一构图）；其余是三栏骨架里的
- * 小控件图标。用 stroke 而非 fill，跟 dsw 的线性图标语言一致。
+ * 应用图标必须自带颜色（蓝底白提示符），与包内 icon.svg 同一构图：宿主把
+ * 插件图标当 <img> 塞进 40/48px 的框里，纯 currentColor 的线框在深色主题下
+ * 只剩一圈灰线，和系统自带插件（蓝白渐变）摆在一起明显不统一
+ * （2026-10-24 用户截图）。三栏骨架里的小控件图标继续走 currentColor。
  */
 import React from 'react';
 
 /**
- * SSH 应用图标：主机框 + 提示符。
+ * SSH 应用图标：蓝色渐变方块 + 白色提示符（与 icon.svg 同一构图）。
  * @param {{size?: number}} props 尺寸（默认 24）。
  * @returns {JSX.Element} SVG 元素。
  */
 export function SshIcon({ size = 24, ...rest }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true" {...rest}>
-      <rect x="2.5" y="3.5" width="19" height="17" rx="3" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M7 9.5 10.5 12 7 14.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M12.5 15H17" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    <svg width={size} height={size} viewBox="0 0 36 36" fill="none" aria-hidden="true" {...rest}>
+      <rect x="4" y="6" width="28" height="24" rx="7" fill="url(#dsh-ssh-tile)" />
+      <path d="M11.5 13.2 17 18 11.5 22.8" stroke="#FFFFFF" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M19.2 22.8H24.8" stroke="#FFFFFF" strokeWidth="3" strokeLinecap="round" />
+      <defs>
+        <linearGradient id="dsh-ssh-tile" x1="6" y1="7" x2="30" y2="29" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#6FB2EE" />
+          <stop offset="1" stopColor="#3E58D6" />
+        </linearGradient>
+      </defs>
     </svg>
   );
 }

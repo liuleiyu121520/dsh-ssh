@@ -24,6 +24,46 @@ const BULLET = /^\s*[-*+]\s+(.*)$/;
 const ORDERED = /^\s*(\d+)[.)]\s+(.*)$/;
 /** 引用行。 */
 const QUOTE = /^\s*>\s?(.*)$/;
+/** 表格分隔行（| --- | :---: |）。 */
+const TABLE_DIVIDER = /^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$/;
+
+/**
+ * 把一行表格拆成单元格。
+ * @param {string} line 表格行。
+ * @returns {string[]} 单元格（已去首尾竖线与空白）。
+ */
+function splitRow(line) {
+  // 转义的竖线先换成占位符，免得被当分隔符劈开。
+  const text = line.replace(/\\\|/g, '\u0000');
+  const trimmed = text.trim().replace(/^\|/, '').replace(/\|$/, '');
+  return trimmed.split('|').map((cell) => cell.replace(/\u0000/g, '|').trim());
+}
+
+/**
+ * 判断某一行是不是表格分隔行（决定上一行是不是表头）。
+ * @param {string|undefined} line 下一行。
+ * @returns {boolean} 是分隔行返回 true。
+ */
+function isTableDivider(line) {
+  if (line === undefined || line.includes('|') === false) return false;
+  return TABLE_DIVIDER.test(line);
+}
+
+/**
+ * 分隔行 → 每列的对齐方式。
+ * @param {string} line 分隔行。
+ * @returns {Array<'left'|'center'|'right'|null>} 对齐方式。
+ */
+function parseAlign(line) {
+  return splitRow(line).map((cell) => {
+    const left = cell.startsWith(':');
+    const right = cell.endsWith(':');
+    if (left && right) return 'center';
+    if (right) return 'right';
+    if (left) return 'left';
+    return null;
+  });
+}
 
 /**
  * 解析 markdown 文本为块数组。
@@ -119,6 +159,29 @@ export function parseMarkdown(text) {
       flush();
       blocks.push({ kind: 'quote', text: quote[1] });
       index += 1;
+      continue;
+    }
+
+    // 表格：当前行含竖线，且下一行是 `| --- |` 分隔行。
+    if (line.includes('|') === true && isTableDivider(lines[index + 1]) === true) {
+      flush();
+      const header = splitRow(line);
+      const align = parseAlign(lines[index + 1]);
+      index += 2;
+      /** @type {string[][]} */
+      const rows = [];
+      while (index < lines.length && lines[index].trim() !== '' && lines[index].includes('|') === true) {
+        rows.push(splitRow(lines[index]));
+        index += 1;
+      }
+      // 列数对齐表头：短的补空，长的截断（表格结构不能因为某行多一格就崩）。
+      const width = header.length;
+      const normalized = rows.map((row) => {
+        const cells = row.slice(0, width);
+        while (cells.length < width) cells.push('');
+        return cells;
+      });
+      blocks.push({ kind: 'table', header, align, rows: normalized });
       continue;
     }
 

@@ -109,6 +109,38 @@ const quoteStyle = {
   wordBreak: 'break-word',
 };
 
+/** 表格外框：窄面板里靠横向滚动兜底，不把气泡撑破。 */
+const tableWrapStyle = {
+  margin: 0,
+  overflowX: 'auto',
+};
+
+/** 表格本体：细边线、紧凑内边距，跟终端风格一致。 */
+const tableStyle = {
+  borderCollapse: 'collapse',
+  width: '100%',
+  fontSize: '12px',
+  lineHeight: '18px',
+  color: 'var(--dsw-alias-label-primary)',
+};
+
+/** 单元格。 */
+const cellStyle = {
+  padding: '4px 8px',
+  border: '0.5px solid var(--dsw-alias-border-l2)',
+  verticalAlign: 'top',
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+};
+
+/** 表头单元格。 */
+const headCellStyle = {
+  fontWeight: 500,
+  color: 'var(--dsw-alias-label-secondary)',
+  background: 'var(--dsw-alias-bg-layer-2)',
+  whiteSpace: 'nowrap',
+};
+
 /** 命令卡状态 → 颜色（成功=品牌色，失败=错误色，其余=弱化）。 */
 const CALL_COLORS = {
   awaiting: 'var(--dsw-alias-label-tertiary)',
@@ -227,6 +259,34 @@ export function RichText({ text }) {
                 </li>
               ))}
             </ListTag>
+          );
+        }
+        if (block.kind === 'table') {
+          return (
+            <div key={`b${index}`} style={tableWrapStyle}>
+              <table style={tableStyle}>
+                <thead>
+                  <tr>
+                    {block.header.map((cell, cellIndex) => (
+                      <th key={`h${cellIndex}`} style={{ ...cellStyle, ...headCellStyle, textAlign: block.align[cellIndex] ?? 'left' }}>
+                        {inlineNodes(cell)}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rowIndex) => (
+                    <tr key={`r${rowIndex}`}>
+                      {row.map((cell, cellIndex) => (
+                        <td key={`c${cellIndex}`} style={{ ...cellStyle, textAlign: block.align[cellIndex] ?? 'left' }}>
+                          {inlineNodes(cell)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           );
         }
         if (block.kind === 'quote') {

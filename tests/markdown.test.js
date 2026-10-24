@@ -80,3 +80,34 @@ test('empty input yields no blocks', () => {
   assert.deepEqual(parseMarkdown(''), []);
   assert.deepEqual(parseMarkdown('   \n\n'), []);
 });
+
+test('gfm table becomes a table block with alignment', () => {
+  const blocks = parseMarkdown([
+    '| ID | 项目 | 内存 |',
+    '|:--|:--:|--:|',
+    '| 0 | fasong-service | 87.8 MB |',
+    '| 1 | picture-service | 86.3 MB |',
+  ].join('\n'));
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].kind, 'table');
+  assert.deepEqual(blocks[0].header, ['ID', '项目', '内存']);
+  assert.deepEqual(blocks[0].align, ['left', 'center', 'right']);
+  assert.deepEqual(blocks[0].rows[0], ['0', 'fasong-service', '87.8 MB']);
+  assert.equal(blocks[0].rows.length, 2);
+});
+
+test('table rows are padded or trimmed to the header width', () => {
+  const blocks = parseMarkdown('| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |');
+  assert.deepEqual(blocks[0].rows, [['1', ''], ['1', '2']]);
+});
+
+test('a pipe line without a divider row stays a paragraph', () => {
+  const blocks = parseMarkdown('用 `a | b` 这种写法\n不构成表格');
+  assert.equal(blocks[0].kind, 'paragraph');
+});
+
+test('table ends at a blank line and the next block parses normally', () => {
+  const blocks = parseMarkdown('| a | b |\n|---|---|\n| 1 | 2 |\n\n结论：正常');
+  assert.deepEqual(blocks.map((block) => block.kind), ['table', 'paragraph']);
+  assert.deepEqual(blocks[1].lines, ['结论：正常']);
+});

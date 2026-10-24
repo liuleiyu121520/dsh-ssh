@@ -159,13 +159,14 @@ test('normalizeHistory drops invalid shapes and keeps tool-call blocks', () => {
     'string-dropped',
   ], { provider: 'p1', model: 'm1' });
   assert.equal(history.length, 3);
-  assert.deepEqual(history[0], { role: 'user', content: '看看磁盘' });
+  // content 一律是块数组（DeepSeek 序列化器会对它调 flatMap）。
+  assert.deepEqual(history[0], { role: 'user', content: [{ type: 'text', text: '看看磁盘' }] });
   assert.equal(history[1].content.length, 2);
   assert.equal(history[1].content[1].type, 'tool-call');
   // assistant 必须带 source：真 runtime 的 forAdapter 会读 source.replayState，
   // 缺了会被包装成"模型静默结束"（2026-10-24 真机 E2E 实测）。
   assert.deepEqual(history[1].source, { kind: 'model', provider: 'p1', model: 'm1' });
-  assert.deepEqual(history[2], { role: 'tool', toolCallId: 'c1', content: 'output', isError: false });
+  assert.deepEqual(history[2], { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'output' }], isError: false });
 });
 
 test('normalizeHistory caps length and drops system messages', () => {
@@ -174,8 +175,8 @@ test('normalizeHistory caps length and drops system messages', () => {
   many.unshift({ role: 'system', content: 'stale' });
   const history = normalizeHistory(many);
   assert.equal(history.length, 30);
-  assert.equal(history[0].content, 'm10');
-  assert.equal(history.at(-1).content, 'm39');
+  assert.deepEqual(history[0].content, [{ type: 'text', text: 'm10' }]);
+  assert.deepEqual(history.at(-1).content, [{ type: 'text', text: 'm39' }]);
 });
 
 // ── executeInSession：marker 捕获 ─────────────────────────────────────
@@ -612,4 +613,63 @@ test('runTurn does not retry once text has been emitted', async () => {
   assert.equal(events.some((event) => event.type === 'retry'), false);
   assert.equal(events.at(-1).type, 'error');
   assert.equal(llm.attempts(), 1, '不该有第二次尝试');
+});
+
+// ── content 必须是块数组（DeepSeek 官方通道的硬要求）──────────────────
+
+test('normalizeHistory turns string content into text blocks', () => {
+  // llm-deepseek 的序列化器直接 `message.content.flatMap(...)`；字符串没有
+  // flatMap → TypeError → 被包成 TRANSPORT（"Messages transport failed"）。
+  // 免费通道有 blocksOf() 容错，所以只有官方通道每次必挂。
+  const history = normalizeHistory([
+    { role: 'user', content: '看看 nginx' },
+    { role: 'tool', toolCallId: 'c1', content: 'total 0', isError: false },
+  ]);
+  assert.deepEqual(history[0].content, [{ type: 'text', text: '看看 nginx' }]);
+  assert.deepEqual(history[1].content, [{ type: 'text', text: 'total 0' }]);
+  assert.equal(Array.isArray(history[0].content), true);
+  assert.equal(Array.isArray(history[1].content), true);
+});
+
+test('normalizeHistory never emits a string or undefined content', () => {
+  const history = normalizeHistory([
+    { role: 'user', content: '' },
+    { role: 'user', content: 42 },
+    { role: 'assistant', content: '纯文本' },
+  ]);
+  for (const message of history) {
+    assert.equal(Array.isArray(message.content), true, `content 必须是数组：${JSON.stringify(message)}`);
+  }
+});
+
+test('runTurn hands the adapter block arrays (DeepSeek serializer shape)', async () => {
+  const { service } = makeShellService(shellWith('x'));
+  service.open({ host: LOCAL_HOST });
+  /** 模拟 llm-deepseek：对 content 调 flatMap，字符串会直接炸。 */
+  const llm = {
+    listProviders: () => [{ id: 'p1', name: 'P1' }],
+    listModels: async () => [{ id: 'm1', label: 'M1' }],
+    prepareCall: async (config) => ({
+      config: { provider: config.provider, model: config.model },
+      stream: (options) => {
+        for (const message of options.messages) {
+          // 这一行就是 serialize.ts:122 的行为。
+          message.content.flatMap((block) => [block]);
+        }
+        return textRound();
+      },
+    }),
+  };
+  const chat = createChatService({ service, llm });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '看看 nginx' }],
+    autoExecute: false,
+    provider: 'p1',
+    model: 'm1',
+    onEvent: (event) => events.push(event),
+  });
+  assert.deepEqual(events.map((event) => event.type), ['accepted', 'model', 'text', 'finish']);
 });

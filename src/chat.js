@@ -171,13 +171,22 @@ export function normalizeHistory(history, source = {}) {
 }
 
 /**
- * 归一 content：string 原样；数组只保留 text/tool-call 块。
+ * 归一 content 成**块数组**。
+ *
+ * 必须永远是数组，不能是字符串：DeepSeek 官方通道的序列化器直接写
+ * `message.content.flatMap(...)`（llm-deepseek/src/serialize.ts:121-122），
+ * 字符串没有 flatMap → TypeError → 被 adapter 包成 `TRANSPORT`
+ * → 表现为 "DeepSeek Messages transport failed"，而且**每次必失败**
+ * （重试 5 次也一样）。免费通道有 `blocksOf()` 容错字符串，所以只有官方
+ * 通道炸——这就是"原生能答、右栏必挂"的真正原因（2026-10-24 定位）。
  * @param {unknown} content 原始 content。
- * @returns {string|object[]} 归一后的 content。
+ * @returns {object[]} 块数组（可能是空数组）。
  */
 function normalizeContent(content) {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
+  if (typeof content === 'string') {
+    return content === '' ? [] : [{ type: 'text', text: content }];
+  }
+  if (!Array.isArray(content)) return [];
   /** @type {object[]} */
   const blocks = [];
   for (const block of content) {
@@ -197,7 +206,7 @@ function normalizeContent(content) {
       });
     }
   }
-  return blocks.length === 0 ? '' : blocks;
+  return blocks;
 }
 
 /**

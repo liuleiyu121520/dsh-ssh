@@ -464,6 +464,48 @@ function TurnMessage({ sid, message, showLabel = true }) {
 }
 
 /**
+ * 空对话时的推荐内容：一句说明 + 三条可点的建议。
+ *
+ * 抽成组件是因为它有两处落脚点：正常空态放在消息区顶部；空对话（blank）时
+ * 挂在输入框**上方**——那时输入框要居中，推荐内容靠绝对定位悬在它头上，
+ * 不参与布局，否则会把输入框往下推。
+ * @returns {JSX.Element} 推荐内容。
+ */
+function ChatHero() {
+  return (
+    <div style={{ padding: '0 16px 12px' }}>
+      <div style={{ fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-secondary)' }}>{t('chatSubtitle')}</div>
+      <div style={{ marginTop: '10px', fontSize: '10px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatSuggestHint')}</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '6px' }}>
+        {[t('suggestion1'), t('suggestion2'), t('suggestion3')].map((text, index) => (
+          <button
+            key={`suggest-${index}`}
+            type="button"
+            onClick={() => void actions.sendChat(text)}
+            style={{
+              display: 'block',
+              width: '100%',
+              textAlign: 'left',
+              padding: '7px 9px',
+              border: '0.5px solid var(--dsw-alias-border-l2)',
+              borderRadius: '7px',
+              cursor: 'pointer',
+              font: 'inherit',
+              fontSize: '11px',
+              lineHeight: '16px',
+              color: 'var(--dsw-alias-label-secondary)',
+              background: 'var(--dsw-alias-bg-layer-2)',
+            }}
+          >
+            {text}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
  * 消息列表：user 气泡 + assistant 回合 + 错误条。
  * @param {{sid: string}} props 参数。
  * @returns {JSX.Element} 消息列表。
@@ -474,7 +516,7 @@ function ChatMessages({ sid }) {
 
   useEffect(() => {
     // 新消息/流式增量到底部：对话面板的基本礼貌。
-    // 空对话不滚——那时输入区是垂直居中的，scrollIntoView 会去滚外层容器
+    // 空对话不滚——那时输入框是垂直居中的，scrollIntoView 会去滚外层容器
     // （启动台页面），进来就跳一下。
     if (chat.messages.length === 0) return;
     bottomRef.current?.scrollIntoView({ block: 'end' });
@@ -482,37 +524,7 @@ function ChatMessages({ sid }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', padding: '12px' }}>
-      {chat.messages.length === 0 && chat.streaming !== true ? (
-        <div style={{ padding: '12px 4px' }}>
-          <div style={{ fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-secondary)' }}>{t('chatSubtitle')}</div>
-          <div style={{ marginTop: '10px', fontSize: '10px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatSuggestHint')}</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '6px' }}>
-            {[t('suggestion1'), t('suggestion2'), t('suggestion3')].map((text, index) => (
-              <button
-                key={`suggest-${index}`}
-                type="button"
-                onClick={() => void actions.sendChat(text)}
-                style={{
-                  display: 'block',
-                  width: '100%',
-                  textAlign: 'left',
-                  padding: '7px 9px',
-                  border: '0.5px solid var(--dsw-alias-border-l2)',
-                  borderRadius: '7px',
-                  cursor: 'pointer',
-                  font: 'inherit',
-                  fontSize: '11px',
-                  lineHeight: '16px',
-                  color: 'var(--dsw-alias-label-secondary)',
-                  background: 'var(--dsw-alias-bg-layer-2)',
-                }}
-              >
-                {text}
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : null}
+      {chat.messages.length === 0 && chat.streaming !== true ? <ChatHero /> : null}
       {chat.messages.map((message, index) => {
         if (message.role === 'user') {
           return (
@@ -942,32 +954,33 @@ function ChatComposer({ sid, streaming, pending }) {
 }
 
 /**
- * 空对话时输入区落在**约 1/3 高度**处，不是垂直正中（2026-10-25 用户定）。
+ * 空对话时**输入框本身垂直居中**，推荐内容悬在它正上方（2026-10-25 用户定：
+ * "我说的是整体，相当于文本框位于中间"）。
  *
- * 为什么不是正中：输入区上面还有推荐内容（副标题 + 三条建议），它们把输入框
- * 往下推。把「推荐 + 输入」整组居中，输入框实际会掉到 55%~65%，看着像贴底。
+ * 关键区别：居中的对象是输入框，不是"推荐 + 输入"这一坨。若把整坨居中，
+ * 输入框会被上面的推荐内容（实测 217px）顶到 55%~65%，看着像贴底；上一版
+ * 又试图用顶部留白把它顶到 1/3，也不对。正解是让推荐内容**脱离布局**：
+ * 绝对定位挂在内层容器的 `bottom:100%` 上，外层只负责把输入框居中。
  *
- * 几何账：整组高度 H ≈ 300px（副标题 38 + 提示 14 + 三条建议 108 + 输入框
- * 106 + 边距），输入框中心 ≈ 顶部留白 + H − 53。要让它落在面板高度 1/3
- * （760px 高约 250px 处），顶部留白只能是几像素——也就是「推荐内容紧贴头部、
- * 输入框正好压在 1/3 线上、下面三分之二留给对话往上长」。面板矮时整组先被压
- * （消息区 flexShrink:1 + overflow auto 兜底），不会溢出。
+ * 有消息时这层外壳只剩内容高度（flexGrow:0），输入框自然贴底。
  */
-const EMPTY_TOP_GAP = 8;
+const composerSlotStyle = {
+  flexShrink: 0,
+  flexBasis: 'auto',
+  minHeight: 0,
+  display: 'flex',
+  flexDirection: 'column',
+  justifyContent: 'center',
+  // 面板被拖得很矮时，悬在输入框上方的推荐内容会顶到头部去（实测 420px 高
+  // 就开始压住标题）。裁在这层外壳的上沿——也就是头部下边框——比压字好看。
+  overflow: 'hidden',
+};
 
-/** 空对话时的上留白：几像素，把整组顶到头部下方。 */
-const spacerEmptyTopStyle = { flexGrow: 0, flexShrink: 0, flexBasis: EMPTY_TOP_GAP, minHeight: 0 };
+/** 推荐内容的挂载点：输入框的定位参照，自己不占高度。 */
+const heroAnchorStyle = { position: 'relative' };
 
-/** 空对话时的下留白：吃掉剩下的全部高度，消息区就停在内容高度上。 */
-const spacerEmptyBottomStyle = { flexGrow: 1, flexShrink: 1, flexBasis: 0, minHeight: 0 };
-
-/**
- * 有消息时两个占位都收成 0（消息区自己 flexGrow:1 吃满剩余高度）。
- *
- * 占位节点**始终在 DOM 里**、只换尺寸，是为了让 composer 的兄弟位置不变：
- * 切态时 React 不会重挂 textarea，用户正在打的草稿不会丢。
- */
-const spacerCollapsedStyle = { flexGrow: 0, flexShrink: 0, flexBasis: 0, minHeight: 0 };
+/** 推荐内容本体：贴住输入框上沿，不参与布局。 */
+const heroFloatStyle = { position: 'absolute', left: 0, right: 0, bottom: '100%' };
 
 /**
  * 右栏面板：模型控制 + 消息列表 + 输入区。
@@ -988,8 +1001,7 @@ export function ChatPane() {
   /**
    * 空对话：还没说过一句话（也没在跑、也没报错）。
    *
-   * 这一态下输入区落在面板**约 1/3 高度**处（不是垂直正中）：上面是推荐内容，
-   * 下面三分之二留给对话往上长。说过话之后输入区沉到底部。
+   * 这一态下**输入框垂直居中**、推荐内容悬在它上方；说过话之后输入框沉到底部。
    */
   const blank = sid !== null
     && llmUnavailable !== true
@@ -1000,9 +1012,11 @@ export function ChatPane() {
 
   /**
    *  body 区：没会话 / 没模型 / 正常对话 三态。
-   * @returns {JSX.Element} 内容。
+   * @returns {JSX.Element|null} 内容。
    */
   const renderBody = () => {
+    // 空对话：推荐内容归输入区外壳管（要悬在输入框上方），消息区让出全部高度。
+    if (blank === true) return null;
     if (sid === null) {
       return (
         <div style={{ padding: '24px 16px' }}>
@@ -1046,15 +1060,9 @@ export function ChatPane() {
         </button>
       </div>
       {/**
-       * 上下两个占位夹住「消息区 + 输入区」：
-       * - 空对话：上留白几像素、下留白吃掉全部剩余高度 → 推荐内容贴着头部，
-       *   输入区落在面板约 1/3 处，下面三分之二留给对话往上长。
-       * - 有消息：两个占位都归零，消息区 flexGrow:1 吃满、输入区贴底。
-       *
-       * 用 flexGrow/flexShrink/flexBasis 长写而不是 flex 简写：简写要过一遍
-       * cssstyle 的语法解析，`1 1 0` 这类无单位 basis 在部分环境会被丢掉。
+       * 消息区：有消息时 flexGrow:1 吃满剩余高度；空对话时高度归零（内容为空），
+       * 把整块地方让给下面的输入区外壳。
        */}
-      <div style={blank ? spacerEmptyTopStyle : spacerCollapsedStyle} aria-hidden="true" />
       <div
         style={{
           flexGrow: blank ? 0 : 1,
@@ -1066,10 +1074,28 @@ export function ChatPane() {
       >
         {renderBody()}
       </div>
-      {sid !== null && llmUnavailable !== true ? (
-        <ChatComposer sid={sid} streaming={chat?.streaming === true} pending={chat?.pending === true} />
-      ) : null}
-      <div style={blank ? spacerEmptyBottomStyle : spacerCollapsedStyle} aria-hidden="true" />
+      {/**
+       * 输入区外壳：
+       * - 空对话：flexGrow:1 吃掉全部剩余高度 + justifyContent:center → **输入框
+       *   本身垂直居中**；推荐内容靠绝对定位悬在它正上方（heroFloatStyle），
+       *   不参与布局，所以不会把输入框往下推。
+       * - 有消息：flexGrow:0 只剩内容高度 → 输入框贴底。
+       *
+       * 两个子节点都带 key：切态时 React 按 key 匹配，插入/移除推荐内容不会
+       * 把 textarea 重挂（草稿不丢）。
+       */}
+      <div style={{ ...composerSlotStyle, flexGrow: blank ? 1 : 0 }}>
+        <div style={heroAnchorStyle}>
+          {blank ? (
+            <div key="hero" style={heroFloatStyle}>
+              <ChatHero />
+            </div>
+          ) : null}
+          {sid !== null && llmUnavailable !== true ? (
+            <ChatComposer key="composer" sid={sid} streaming={chat?.streaming === true} pending={chat?.pending === true} />
+          ) : null}
+        </div>
+      </div>
     </aside>
   );
 }

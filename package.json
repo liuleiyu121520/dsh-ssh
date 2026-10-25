@@ -43,7 +43,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "node scripts/build.mjs --check",
-    "test": "node --test \"tests/**/*.test.js\"",
+    "test": "node --test --test-force-exit \"tests/**/*.test.js\"",
     "test:real": "node tests/real-host.smoke.mjs",
     "test:e2e": "node scripts/e2e.mjs"
   },

@@ -11,11 +11,12 @@
  * 3. 焦点丢失   —— 记 `hadFocus`，回来时 `focus()`；
  * 4. 内存上限   —— store 的 LRU 淘汰（MAX_RUNTIMES）。
  */
-import React, { useLayoutEffect, useRef } from 'react';
+import React, { useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 // xterm 的 CSS 在构建时被 esbuild 读成字符串（--loader:.css=text），这里
 // 运行时注入一次 <style>；不引 CDN，离线可用。
 import xtermCss from '@xterm/xterm/css/xterm.css';
-import { getRuntime } from './store.js';
+import { actions, getRuntime, getState, subscribe } from './store.js';
+import { TransferBar } from './TransferBar.jsx';
 
 /** 保证 xterm 样式只注入一次。 */
 if (typeof document !== 'undefined' && document.getElementById('dsh-ssh-xterm-css') === null) {
@@ -32,6 +33,13 @@ if (typeof document !== 'undefined' && document.getElementById('dsh-ssh-xterm-cs
  */
 export function Terminal({ sid }) {
   const box = useRef(null);
+  const state = useSyncExternalStore(subscribe, getState);
+
+  // 传输事件跟着会话走（与 runtime 同一保活哲学）：挂载即订阅，幂等。
+  // 退订只在 teardownAll（关卡片）里做——那时连接本来就要全断。
+  useLayoutEffect(() => {
+    actions.watchTransfer(sid);
+  }, [sid]);
 
   useLayoutEffect(() => {
     const container = box.current;
@@ -63,5 +71,10 @@ export function Terminal({ sid }) {
     };
   }, [sid]);
 
-  return <div ref={box} style={{ width: '100%', height: '100%', minHeight: 0 }} />;
+  return (
+    <div style={{ position: 'relative', width: '100%', height: '100%', minHeight: 0 }}>
+      <div ref={box} style={{ width: '100%', height: '100%', minHeight: 0 }} />
+      <TransferBar sid={sid} transfer={state.transfers[sid]} />
+    </div>
+  );
 }

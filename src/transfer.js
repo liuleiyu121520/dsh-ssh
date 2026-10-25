@@ -15,19 +15,23 @@
  *   `session.start()` 回 ZRINIT → 对端发 ZFILE（offer）→ `accept()` 收载荷
  *   → 落盘 → 通知客户端下载。
  *
- * ── 两个实测踩出来的坑（2026-10-25，本机 lrzsz 端到端验证） ───────────
- * 1. `zmodem.js` 的 hex 字符表只认小写（`HEX_DIGITS` 到 102 即 'f' 为止），
- *    遇到大写 A-F 会解析成 NaN。lrzsz 自己发小写，但别的实现不一定，所以
- *    这里在运行时给 `ENCODELIB.parse_hex_octets` 打一层大小写归一化，
- *    **不改 node_modules**（也就不需要 patch-package）。
- * 2. Sentry 的检测要求"ZMODEM 头恰好是缓冲区的结尾"（`_parse` 里 cache 非空
- *    就返回 null）。远端把 `帧 + CR/LF/XON` 一次吐过来时整块喂会漏检，
- *    所以**检测阶段逐字节喂**，会话建立后再整块喂。
+ * ── 一个实测踩出来的坑（2026-10-25，本机 lrzsz 端到端验证） ─────────────
+ * **必须整块喂，不能逐字节喂。** `Sentry._parse` 在解析不完整时会 `break`，
+ * 紧接着执行 `cache.splice(MAX_ZM_HEX_START_LENGTH)`（21）。逐字节喂时
+ * `**\x18B` 前缀每次刚长出来就被截掉，永远检测不到；整块喂（按 ssh2 的
+ * data 事件）一帧一次进 cache，`find_subarray` 当场命中。真机上 lrzsz 的
+ * ZRINIT/ZRQINIT 都是单独一个小包，天然就是整块。
+ *
+ * 另：`zmodem.js` 的 hex 字符表只认小写（`HEX_DIGITS` 到 102 即 'f'），
+ * 大写 A-F 会解析成 NaN。lrzsz 自己发小写，但别的实现不一定，所以在运行时
+ * 给 `ENCODELIB.parse_hex_octets` 包了一层大小写归一化（**不改
+ * node_modules**，也就不需要 patch-package）。这一层未经大写实现真机验证，
+ * 属防御性质。
  */
 import { createRequire } from 'node:module';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 // eslint-disable-next-line import/no-unresolved -- 运行期依赖，见 package.json
@@ -44,6 +48,20 @@ const CHUNK_BYTES = 8192;
 const PICK_FILE_TIMEOUT_MS = 60000;
 /** 接收文件的临时目录。 */
 const TRANSFER_DIR = join(tmpdir(), 'dsh-ssh-transfers');
+
+/**
+ * 把对端给的文件名洗成安全的单段名。
+ *
+ * `sz` 传来的 name 是远端任意字符串，可能带 `/`、`..`——直接拼路径就是路径
+ * 穿越（能写到临时目录外的任何地方）。只留 basename 再砍掉隐藏文件形态。
+ * @param {unknown} name 原始文件名。
+ * @returns {string} 安全的单段文件名。
+ */
+function safeName(name) {
+  const base = basename(String(name ?? '')).replace(/[\u0000-\u001f]/g, '').trim();
+  if (base === '' || base === '.' || base === '..') return 'download.bin';
+  return base;
+}
 
 /**
  * 造传输管理器。
@@ -116,6 +134,27 @@ export function createTransferManager(options = {}) {
     contexts.delete(sid);
   };
 
+  /** sid -> 已收到的文件 { name -> { size, path } }（下载端点据此取文件）。 */
+  const received = new Map();
+
+  /**
+   * 读回某个会话刚收到的文件（下载端点用）。
+   * @param {string} sid 会话 id。
+   * @param {string} name 文件名（safeName 之后的）。
+   * @returns {Promise<{name: string, size: number, data: Buffer}|null>} 文件或 null。
+   */
+  const readReceived = async (sid, name) => {
+    const entry = received.get(sid)?.get(safeName(name));
+    if (entry === undefined) return null;
+    try {
+      const data = await readFile(entry.path);
+      return { name: entry.name, size: data.length, data };
+    } catch {
+      // 文件被外部删了/临时目录被清：当作没有，让端点回 404。
+      return null;
+    }
+  };
+
   /**
    * 处理"对端要收文件"（rz）：建出 send 会话后向客户端要文件。
    * @param {string} sid 会话 id。
@@ -158,7 +197,7 @@ export function createTransferManager(options = {}) {
         return;
       }
       const details = offer.get_details?.() ?? {};
-      const name = String(details.name ?? 'download.bin');
+      const name = safeName(details.name);
       const size = Number(details.size ?? 0);
       emit(sid, { type: 'transfer', phase: 'offer', mode: 'receive', name, size });
       let payloads = [];
@@ -177,6 +216,10 @@ export function createTransferManager(options = {}) {
         await mkdir(TRANSFER_DIR, { recursive: true });
         const path = join(TRANSFER_DIR, `${sid}-${name}`);
         await writeFile(path, data);
+        // 登记到已收表：下载端点按 sid + name 取。settle() 时一起清。
+        const table = received.get(sid) ?? new Map();
+        table.set(name, { name, size: data.length, path });
+        received.set(sid, table);
         emit(sid, { type: 'transfer', phase: 'complete', mode: 'receive', name, size: data.length, path });
       } catch (error) {
         logger(`transfer: cannot write ${name}: ${error?.message ?? error}`);
@@ -225,28 +268,24 @@ export function createTransferManager(options = {}) {
     context.unsub = service.subscribe(sid, (event) => {
       if (event?.kind !== 'data') return;
       const bytes = new Uint8Array(Buffer.from(event.data, 'base64'));
-      // 坑 2：检测阶段逐字节喂，否则"帧 + CR/LF/XON"整块到达会漏检。
-      if (context.session === null) {
-        for (let index = 0; index < bytes.length; index += 1) {
-          context.sentry.consume([bytes[index]]);
-          if (context.session !== null) {
-            // 会话已建立：剩下的字节整块交给它。
-            if (index + 1 < bytes.length) context.sentry.consume(bytes.subarray(index + 1));
-            return;
-          }
-        }
-        return;
-      }
+      // 整块喂：Sentry 的 cache 在解析不完整时会被 splice(21) 截断，逐字节
+      // 喂会让 `**\x18B` 前缀永远长不起来（实测检测不到，见文件头）。
       context.sentry.consume(bytes);
     });
   };
 
   /**
    * 摘掉某个会话的嗅探（会话关闭 / 插件卸载）。
+   *
+   * 与 settle 的区别：这里**才**清已收文件表。settle 只是"这一轮传输结束"，
+   * 收好的文件还要留在临时目录里等用户点下载；会话关了才真的取不到。
    * @param {string} sid 会话 id。
    * @returns {void}
    */
-  const detach = (sid) => settle(sid);
+  const detach = (sid) => {
+    settle(sid);
+    received.delete(sid);
+  };
 
   /**
    * 用户选好了文件：把它发出去（`rz` 流程的后半段）。
@@ -260,7 +299,7 @@ export function createTransferManager(options = {}) {
       return { ok: false, error: '当前没有等待上传的会话' };
     }
     const session = context.session;
-    const name = String(file?.name ?? 'upload.bin');
+    const name = safeName(file?.name);
     const data = Buffer.isBuffer(file?.data) ? file.data : Buffer.from(file?.data ?? []);
     if (context.timer !== null) clearTimeout(context.timer);
     context.timer = null;
@@ -304,8 +343,9 @@ export function createTransferManager(options = {}) {
    */
   const dispose = () => {
     for (const sid of [...contexts.keys()]) settle(sid);
+    received.clear();
     listeners.clear();
   };
 
-  return { attach, detach, isActive, onEvent, sendFile, dispose };
+  return { attach, detach, isActive, onEvent, sendFile, readReceived, dispose };
 }

@@ -19,6 +19,7 @@ import { HostStore, seedHostsFromConfig } from './hosts.js';
 import { createVault } from './vault.js';
 import { createSshTools } from './tools.js';
 import { createChatService } from './chat.js';
+import { createTransferManager } from './transfer.js';
 import { newHostId, normalizeHostInput } from './schema.js';
 
 export const inject = ['webServer', 'connection'];
@@ -110,11 +111,16 @@ export async function apply(ctx, config = {}) {
     maxContextLines: intIn(config.chat?.maxContextLines, 60, 10, 500),
   };
 
+  // 传输管理器（ZMODEM rz/sz）：只依赖 service 的字节面，与持久化/模型两半
+  // 无关，所以挂在底座上——会话一开就嗅探（用户在 shell 里随时可能敲 rz）。
+  const transfer = createTransferManager({ service, logger });
+
   // 底座：路由立刻注册（不依赖任何可选服务）。
   registerRoutes(ctx, {
     service,
     store: () => state.store,
     chat: () => state.chat,
+    transfer,
     fallbackHosts: buildFallbackHosts(config),
   });
 
@@ -298,6 +304,7 @@ export async function apply(ctx, config = {}) {
       }
     }
     service.closeAll();
+    transfer.dispose();
     state.store = null;
     state.vault = null;
     state.chat = null;

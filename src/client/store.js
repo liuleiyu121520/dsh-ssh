@@ -34,6 +34,9 @@ const MAX_RETRY_MS = 15000;
 /** 主机状态轮询间隔（毫秒）：连接中的状态灯要在几秒内跳到终态。 */
 const POLL_INTERVAL_MS = 2000;
 
+/** sid -> 传输事件的 EventSource（幂等订阅，unwatchTransfer 时关）。 */
+const transferSources = new Map();
+
 /** @type {object} 全局状态；每次变更整体替换，保证 useSyncExternalStore 快照稳定。 */
 let state = {
   hosts: [],
@@ -77,6 +80,14 @@ let state = {
   hostsCollapsed: false,
   /** 左栏当前高亮的主机 id（单击只选中，双击才连接）。 */
   selectedHostId: null,
+  /**
+   * sid -> ZMODEM 传输状态（rz 上传 / sz 下载）。
+   * `{phase, mode, name?, size?, offset?, error?}`；phase 取值见 Host 侧
+   * src/transfer.js：start / need-file / offer / sending / progress /
+   * complete / error / end。只在有传输时存在，end 之后由 UI 自行清理。
+   * @type {Record<string, object>}
+   */
+  transfers: {},
 };
 
 /** @type {Set<() => void>} */
@@ -1119,6 +1130,75 @@ export const actions = {
   },
 
   /**
+   * 订阅某个会话的传输事件（SSE）。幂等：重复调用只保留一条连接。
+   *
+   * 与终端 SSE 分开一条通道：传输期间协议字节不再进 /stream（否则终端是一屏
+   * 乱码），进度必须走 /transfer/events（Host 侧 src/transfer.js）。
+   * @param {string} sid 会话 id。
+   * @returns {void}
+   */
+  watchTransfer(sid) {
+    if (typeof sid !== 'string' || sid === '') return;
+    if (transferSources.has(sid)) return;
+    const source = new EventSource(`/api/dsh-ssh/transfer/events?sid=${encodeURIComponent(sid)}`);
+    transferSources.set(sid, source);
+    source.addEventListener('message', (event) => {
+      let payload = null;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return; // 心跳注释帧等非 JSON：忽略。
+      }
+      if (payload?.type !== 'transfer') return;
+      const transfers = { ...state.transfers, [sid]: { ...payload } };
+      setState({ transfers });
+      // end 是终态：留一小会儿让用户看到结果，然后收回浮层。
+      if (payload.phase === 'end') {
+        setTimeout(() => {
+          if (state.transfers[sid]?.phase === 'end') {
+            const next = { ...state.transfers };
+            delete next[sid];
+            setState({ transfers: next });
+          }
+        }, 4000);
+      }
+    });
+  },
+
+  /**
+   * 退订某个会话的传输事件（会话关闭 / 视图销毁）。
+   * @param {string} sid 会话 id。
+   * @returns {void}
+   */
+  unwatchTransfer(sid) {
+    const source = transferSources.get(sid);
+    if (source === undefined) return;
+    source.close();
+    transferSources.delete(sid);
+  },
+
+  /**
+   * 上传：把浏览器选的文件发给 Host，由协议机送进 PTY。
+   * @param {string} sid 会话 id。
+   * @param {File} file 用户选的文件。
+   * @returns {Promise<{ok: boolean, error?: string}>} 结果。
+   */
+  async uploadFile(sid, file) {
+    if (file === undefined || file === null) return { ok: false, error: 'no file' };
+    try {
+      const data = await file.arrayBuffer();
+      await actions._request('POST', '/transfer/file', {
+        sid,
+        name: file.name,
+        data: Buffer.from(data).toString('base64'),
+      });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error?.message ?? String(error) };
+    }
+  },
+
+  /**
    * 视图销毁：启动台协议 `onTeardown` 的处理（关标签 / 启动台卸载都会调）。
    *
    * 不处理的后果很直接：Host 侧的 SSH 连接还活着（进程里挂着 socket），
@@ -1135,8 +1215,11 @@ export const actions = {
     // 同步：先停轮询（否则 teardown 后还在打 /hosts），再摘全部 runtime
     // （EventSource + xterm DOM + 渲染器，一个都不能留），最后状态归零。
     actions.stopPolling();
-    for (const sid of sids) destroyRuntime(sid);
-    setState({ tabs: [], activeSid: null, sessions: {}, chats: {} });
+    for (const sid of sids) {
+      destroyRuntime(sid);
+      actions.unwatchTransfer(sid);
+    }
+    setState({ tabs: [], activeSid: null, sessions: {}, chats: {}, transfers: {} });
     // 异步：逐个通知 Host 关连接。失败无所谓——Host 侧进程退出时这些
     // 会话反正也没了，本地状态已经不再引用它们。
     for (const sid of sids) {

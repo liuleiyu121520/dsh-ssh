@@ -238,7 +238,7 @@ function handleError(res, error) {
  * @param {object} res 响应。
  * @returns {Promise<void>}
  */
-async function handleStream(ctx, service, req, res) {
+async function handleStream(ctx, service, req, res, transfer = null) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const sid = requireSid(url.searchParams.get('sid'));
   const rawSince = url.searchParams.get('since');
@@ -249,6 +249,9 @@ async function handleStream(ctx, service, req, res) {
 
   const unsubscribe = service.subscribe(sid, (event) => {
     if (event.kind === 'data') {
+      // ZMODEM 传输期间协议字节不进终端：否则用户看到的是一屏乱码，
+      // 而传输进度走 /transfer/events 那条控制帧通道（src/transfer.js）。
+      if (transfer !== null && transfer.isActive(sid) === true) return;
       safeWrite(res, formatSseFrame({ seq: event.seq, data: event.data }));
       return;
     }
@@ -398,6 +401,8 @@ export function registerRoutes(ctx, options = {}) {
     throw new TypeError('dsh-ssh routes: service is required');
   }
   const fallbackHosts = Array.isArray(options.fallbackHosts) ? options.fallbackHosts : [];
+  // 传输管理器（ZMODEM）：缺省 null = 不带传输功能（测试与旧装配照常工作）。
+  const transfer = options.transfer ?? null;
   /**
    * 取当前的 HostStore。
    * @returns {object|null} store 或 null。
@@ -471,7 +476,7 @@ export function registerRoutes(ctx, options = {}) {
   // GET /api/dsh-ssh/stream?sid=&since= —— SSE 终端输出 + 断线回放。
   register('exact', `${PREFIX}/stream`, async (req, res) => {
     if (req.method !== 'GET') throw new HttpError(405, 'GET only');
-    await handleStream(ctx, service, req, res);
+    await handleStream(ctx, service, req, res, transfer);
   });
 
   // POST /api/dsh-ssh/input —— 键盘原始字节（base64）。
@@ -567,6 +572,9 @@ export function registerRoutes(ctx, options = {}) {
     const record = await store.get(body.hostId);
     const auth = await store.getAuth(body.hostId);
     const session = service.open({ host: record, auth, cols: body.cols, rows: body.rows });
+    // 会话一开就挂上字节嗅探：远端随时可能发 ZRINIT/ZRQINIT（用户在 shell
+    // 里敲 rz/sz），错过了这一帧整个传输都发起不来（src/transfer.js）。
+    if (transfer !== null) transfer.attach(session.sid);
     // 会话即便立刻是 error 状态也回 200：客户端要拿到 sid 才能订阅它的 SSE
     // 与看错误原因（设计 §4）。
     sendJson(res, 200, { sid: session.sid, session });
@@ -578,7 +586,76 @@ export function registerRoutes(ctx, options = {}) {
     const body = await readJsonBody(req);
     const sid = requireSid(body.sid);
     service.close(sid);
+    if (transfer !== null) transfer.detach(sid);
     sendJson(res, 200, { ok: true, sid });
+  });
+
+  // ── ZMODEM 文件传输（rz 上传 / sz 下载）────────────────────────────
+  //
+  // 协议机在 Host（src/transfer.js）：它嗅探 ssh2 的字节流，传输期间的协议
+  // 帧不再进 /stream（否则终端是一屏乱码），进度改走这里的三条端点。
+
+  // GET /api/dsh-ssh/transfer/events?sid= —— 传输控制帧（SSE）。
+  register('exact', `${PREFIX}/transfer/events`, async (req, res) => {
+    if (req.method !== 'GET') throw new HttpError(405, 'GET only');
+    if (transfer === null) throw new HttpError(501, 'transfer-unavailable');
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    const sid = requireSid(url.searchParams.get('sid'));
+    service.get(sid); // 会话不存在：明确的 404 语义
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-store',
+      connection: 'keep-alive',
+    });
+    safeWrite(res, ': dsh-ssh transfer events open\n\n');
+    const unsubscribe = transfer.onEvent(sid, (event) => {
+      safeWrite(res, formatSseFrame(event));
+      // end 是终态：发完就收流，别把 SSE 挂成孤儿。
+      if (event?.phase === 'end') {
+        try { res.end(); } catch { /* 连接已断 */ }
+      }
+    });
+    const ping = setInterval(() => safeWrite(res, ': ping\n\n'), PING_INTERVAL_MS);
+    const teardown = () => {
+      clearInterval(ping);
+      unsubscribe();
+    };
+    req.on('close', teardown);
+    res.on('close', teardown);
+    res.on('error', teardown);
+  });
+
+  // POST /api/dsh-ssh/transfer/file —— 上传：浏览器选的文件交给协议机。
+  register('exact', `${PREFIX}/transfer/file`, async (req, res) => {
+    if (req.method !== 'POST') throw new HttpError(405, 'POST only');
+    if (transfer === null) throw new HttpError(501, 'transfer-unavailable');
+    const body = await readJsonBody(req);
+    const sid = requireSid(body.sid);
+    if (typeof body.name !== 'string' || body.name === '') throw new HttpError(400, 'name is required');
+    if (typeof body.data !== 'string') throw new HttpError(400, 'data must be a base64 string');
+    const result = await transfer.sendFile(sid, { name: body.name, data: Buffer.from(body.data, 'base64') });
+    if (result.ok !== true) throw new HttpError(409, result.error ?? 'send failed');
+    sendJson(res, 200, { ok: true });
+  });
+
+  // GET /api/dsh-ssh/transfer/download?sid=&name= —— 下载刚收到的文件。
+  register('exact', `${PREFIX}/transfer/download`, async (req, res) => {
+    if (req.method !== 'GET') throw new HttpError(405, 'GET only');
+    if (transfer === null) throw new HttpError(501, 'transfer-unavailable');
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    const sid = requireSid(url.searchParams.get('sid'));
+    const name = url.searchParams.get('name') ?? '';
+    if (name === '') throw new HttpError(400, 'name is required');
+    const file = await transfer.readReceived(sid, name);
+    if (file === null) throw new HttpError(404, 'no such received file');
+    // 文件名可能带奇怪字符：只保留 basename，并统一按下载处理。
+    const safeName = name.replace(/[^\w.\-]/g, '_');
+    res.writeHead(200, {
+      'content-type': 'application/octet-stream',
+      'content-length': file.data.length,
+      'content-disposition': `attachment; filename="${safeName}"`,
+    });
+    res.end(file.data);
   });
 
   // GET /api/dsh-ssh/context?sid=&lines= —— 右栏上下文卡的数据源（M3）。

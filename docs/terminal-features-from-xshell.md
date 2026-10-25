@@ -138,6 +138,20 @@ dsh-ssh 现状（材料 D）：`store.js` 的 `term.onData` → `POST /input`（
 5. 上传：`<input type=file>` → zmodem.js 编码 → 分片走 `POST /input`。**注意 `routes.js` 的 `MAX_BODY_BYTES = 1MB`**，分片须小于该值。
 6. filexfer.dat：Xshell 用该文件持久化传输目录与选项（材料 B）。dsh-ssh 的对应约束（设计建议）：接收目录固定为浏览器下载目录，不做服务端任意路径写入；上传文件名同样 sanitize。
 
+#### 实际落地（2026-10-25）与上述设计的差异
+
+**协议机放在 Host 侧，不放浏览器。** 终端字节流的唯一真相源在 Host（ssh2 → SSE 分发），把 Sentry 放这里：天然拿到全部字节、传输期间可直接停止向 xterm 广播（否则用户看到一屏乱码）、收到的文件先落 Host 临时目录再走一次普通 HTTP 下载。代价是上传多一跳（浏览器 → Host → PTY），换来客户端零协议状态。
+
+| 设计建议 | 实际实现 |
+|---|---|
+| 客户端喂 zmodem.js 解析 | Host 侧 `src/transfer.js` 的 Sentry 嗅探 ssh2 字节流 |
+| SSE `formatSseFrame` 承载协议字节 | 传输期间 `/stream` **停止广播**这些字节，进度走独立的 `/transfer/events` SSE 控制帧 |
+| 上传分片走 `POST /input` | `POST /transfer/file`（base64 整文件，绕开 1MB 输入上限——那是给键盘输入设的） |
+| 浏览器 Blob 下载 | Host 落盘 `${tmpdir}/dsh-ssh-transfers/`，`GET /transfer/download` 取回 |
+| — | 新浮层 `src/client/TransferBar.jsx`：选文件 / 进度条 / 下载链接，贴终端底部不占布局 |
+
+踩过的坑（都写进了 `src/transfer.js` 头部注释）：**必须整块喂 Sentry，不能逐字节**——`_parse` 解析不完整时 `break` 后执行 `cache.splice(21)`，会把没长齐的 `**\x18B` 前缀反复截掉，逐字节喂永远检测不到。
+
 ### 5.2 SFTP 侧栏最小设计（设计建议）
 
 - 复用 `src/transport.js` 现有 ssh2 连接的 `sftp` 子系统，不新建连接（凭据已在 vault 信封加密中，材料 D）。
@@ -176,7 +190,7 @@ P0 判定标准：不依赖新端点/新依赖、纯客户端 xterm API、崩溃
 | T-09 | P1 | 同 sid 重连（`POST /reconnect`，保留滚动缓冲） | `src/routes.js`、`src/sessions.js`、`src/client/store.js` | M |
 | T-10 | P1 | 开 shell 时 term 固定 `xterm-256color` + `stty -ixon` 注入 | `src/transport.js`、`src/sessions.js` | S |
 | T-11 | P2 | 终端类型选择（八种 term 串映射，主机级） | `src/schema.js`、`src/client/HostForm.jsx`、`src/transport.js` | M |
-| T-12 | P2 | ZMODEM 上传/下载全链路 | 新 `src/client/zmodem.js`、`src/client/store.js`、`src/sessions.js` | L |
+| T-12 | P2 | ZMODEM 上传/下载全链路（**已完成 2026-10-25**，实现与"设计建议"不同：协议机放 Host 侧而非浏览器，见 `src/transfer.js` 头部说明） | `src/transfer.js`、`src/routes.js`、`src/index.js`、`src/client/store.js`、`src/client/TransferBar.jsx` | L |
 | T-13 | P2 | SFTP 侧栏 | `src/routes.js`、`src/transport.js`、新 `src/client/SftpPane.jsx` | L |
 | T-14 | P2 | 端口转发 / 即时隧道（每主机高级设置） | `src/schema.js`、`src/transport.js`、`src/sessions.js`、`src/client/HostForm.jsx` | L |
 

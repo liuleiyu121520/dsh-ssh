@@ -657,6 +657,26 @@ function handleChatEvent(sid, event) {
     });
     return;
   }
+  if (event?.type === 'round') {
+    // 一轮模型响应结束（Host 的多轮工具循环里每轮发一次）。把当前回合
+    // 封口：下一段的正文/命令卡会新建一条 assistant 消息，屏幕上就是
+    // "正文 → 命令卡 → 正文 → …" 的真实先后，而不是所有正文挤在顶部、
+    // 命令卡全堆在后面（2026-10-25 真机）。
+    //
+    // replayState 跟着边界走：每轮的思考签名要落在各自那条消息上，
+    // buildChatHistory 才能把签名放回对应 assistant 消息的第一块。
+    const messages = chatOf(sid).messages.slice();
+    const last = messages[messages.length - 1];
+    if (last !== undefined && last.kind === 'turn' && last.streaming === true) {
+      messages[messages.length - 1] = {
+        ...last,
+        streaming: false,
+        ...event.replayState === undefined ? {} : { replayState: event.replayState },
+      };
+      patchChat(sid, { messages });
+    }
+    return;
+  }
   if (event?.type === 'error') {
     patchChat(sid, { streaming: false, pending: false, slow: false, retrying: null, error: typeof event.message === 'string' ? event.message : 'unknown error' });
     // 模型级失败：把**刚失败的那个通道**记进回避表，再挑一个不同的健康通道

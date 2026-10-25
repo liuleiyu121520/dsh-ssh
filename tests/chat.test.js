@@ -271,11 +271,14 @@ test('runTurn auto-executes tool calls and continues until text finish', async (
     onEvent: (event) => events.push(event),
   });
   const types = events.map((event) => event.type);
-  assert.deepEqual(types, ['accepted', 'model', 'text', 'tool-call', 'tool-result', 'text', 'finish']);
+  // `round` = 轮边界：客户端据此把"正文 + 命令卡"与下一轮分开渲染，
+  // 否则一个回合里所有正文会被拼在顶部、命令卡全堆在下面（2026-10-25）。
+  assert.deepEqual(types, ['accepted', 'model', 'text', 'tool-call', 'tool-result', 'round', 'text', 'finish']);
   const result = events[4];
   assert.equal(result.ok, true);
   assert.match(result.output, /500G 200G/);
-  assert.equal(events[6].reason, 'stop');
+  assert.equal(events[5].type, 'round', '轮边界要落在 tool-result 之后、下一轮正文之前');
+  assert.equal(events[7].reason, 'stop');
   // 命令确实写进了 PTY，且模型轮跑了两次（工具后续跑）。
   assert.equal(Buffer.concat(created[0].sent).toString('utf8').includes('df -h'), true);
   assert.equal(llm.calls(), 2);

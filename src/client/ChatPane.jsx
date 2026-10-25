@@ -415,10 +415,14 @@ function CallCard({ sid, call }) {
 
 /**
  * 一个 assistant 回合：流式文本 + 若干命令卡。
- * @param {{sid: string, message: object}} props 参数。
+ *
+ * 顺序就是**发生顺序**：思考块 → 正文 → 命令卡。多轮工具循环里 Host 每轮
+ * 发一次 `round` 边界，所以这里每次只装一轮，不会出现"结论在上面、命令卡
+ * 堆在下面"（2026-10-25 真机）。
+ * @param {{sid: string, message: object, showLabel?: boolean}} props 参数。
  * @returns {JSX.Element} 回合块。
  */
-function TurnMessage({ sid, message }) {
+function TurnMessage({ sid, message, showLabel = true }) {
   const hasText = typeof message.text === 'string' && message.text !== '';
   const reasoning = typeof message.reasoning === 'string' ? message.reasoning : '';
   const calls = Array.isArray(message.calls) ? message.calls : [];
@@ -427,7 +431,9 @@ function TurnMessage({ sid, message }) {
   }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-      <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatAssistant')}</div>
+      {showLabel === true ? (
+        <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatAssistant')}</div>
+      ) : null}
       {/* 思考过程：思考型模型先想几十秒才有正文，不显示这段就只剩"卡住"的观感。 */}
       {reasoning !== '' ? (
         <details style={reasoningBoxStyle} open={message.streaming === true}>
@@ -504,30 +510,36 @@ function ChatMessages({ sid }) {
           </div>
         </div>
       ) : null}
-      {chat.messages.map((message, index) =>
-        message.role === 'user' ? (
-          <div key={`m${index}`} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px' }}>
-            <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatYou')}</div>
-            <div
-              style={{
-                maxWidth: '92%',
-                padding: '7px 10px',
-                borderRadius: '10px',
-                fontSize: '12px',
-                lineHeight: '18px',
-                color: 'var(--dsw-alias-label-primary)',
-                background: 'var(--dsw-alias-bg-layer-3)',
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-              }}
-            >
-              {message.content}
+      {chat.messages.map((message, index) => {
+        if (message.role === 'user') {
+          return (
+            <div key={`m${index}`} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px' }}>
+              <div style={{ fontSize: '10px', fontWeight: 600, color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatYou')}</div>
+              <div
+                style={{
+                  maxWidth: '92%',
+                  padding: '7px 10px',
+                  borderRadius: '10px',
+                  fontSize: '12px',
+                  lineHeight: '18px',
+                  color: 'var(--dsw-alias-label-primary)',
+                  background: 'var(--dsw-alias-bg-layer-3)',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                }}
+              >
+                {message.content}
+              </div>
             </div>
-          </div>
-        ) : (
-          <TurnMessage key={`m${index}`} sid={sid} message={message} />
-        ),
-      )}
+          );
+        }
+        // 一轮模型响应 = 一条 turn 消息（Host 在每轮之间发 round 边界）。
+        // "助手"标签只在连续 turn 的第一条上出现，否则一个回合里跑四轮命令
+        // 就会顶出四个"助手"——原生对话也是一段回答只标一次。
+        const previous = chat.messages[index - 1];
+        const firstOfRun = previous === undefined || previous.role === 'user' || previous.kind !== 'turn';
+        return <TurnMessage key={`m${index}`} sid={sid} message={message} showLabel={firstOfRun} />;
+      })}
       {chat.streaming === true && chat.messages.every((message) => message.kind !== 'turn' || message.streaming !== true) ? (
         <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-quaternary)' }}>{t('chatThinking')}</div>
       ) : null}

@@ -336,7 +336,8 @@ export function formatChatFrame(event) {
  * POST /api/dsh-ssh/chat —— 对话回合（SSE 事件流）。
  *
  * 事件序列：`model`（选中的 provider/model）→ `text`（增量，可多条）→
- * `tool-call`（待执行/已执行）→ `tool-result` → … → `finish`；
+ * `tool-call`（待执行/已执行）→ `tool-result` → `round`（一轮模型响应结束，
+ * 客户端据此把正文与命令卡分段）→ … → `finish`；
  * 出错是 `error` 帧不断流。finish.reason='tool-call' 表示人工确认模式下
  * 回合暂停，客户端执行后带 tool 结果再次 POST 续跑。
  * @param {() => object|null} getChat 取对话服务（llm 缺失时为 null）。

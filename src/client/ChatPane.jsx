@@ -474,6 +474,9 @@ function ChatMessages({ sid }) {
 
   useEffect(() => {
     // 新消息/流式增量到底部：对话面板的基本礼貌。
+    // 空对话不滚——那时输入区是垂直居中的，scrollIntoView 会去滚外层容器
+    // （启动台页面），进来就跳一下。
+    if (chat.messages.length === 0) return;
     bottomRef.current?.scrollIntoView({ block: 'end' });
   }, [chat.messages, chat.streaming]);
 
@@ -939,6 +942,16 @@ function ChatComposer({ sid, streaming, pending }) {
 }
 
 /**
+ * 空对话时的弹性占位：吃掉一半剩余空间，把「建议 + 输入区」顶到垂直中央。
+ * 与 `spacerCollapsedStyle` 成对出现——两个占位节点始终在 DOM 里，只换尺寸，
+ * 这样 composer 的兄弟位置不变，切换态不会重挂输入框。
+ */
+const spacerGrowStyle = { flexGrow: 1, flexShrink: 1, flexBasis: 0, minHeight: 0 };
+
+/** 有消息时的占位：高度归零（消息区自己吃满剩余高度）。 */
+const spacerCollapsedStyle = { flexGrow: 0, flexShrink: 0, flexBasis: 0, minHeight: 0 };
+
+/**
  * 右栏面板：模型控制 + 消息列表 + 输入区。
  * @returns {JSX.Element} 右栏。
  */
@@ -954,6 +967,19 @@ export function ChatPane() {
 
   const chat = sid === null ? null : (state.chats[sid] ?? { messages: [], streaming: false, error: null });
   const llmUnavailable = state.llm.status === 'unavailable';
+  /**
+   * 空对话：还没说过一句话（也没在跑、也没报错）。
+   *
+   * 这一态下输入区要**垂直居中**——对齐 dsh 原生新会话页（skeleton/HeroShell
+   * 的 `.root { height:100%; align-items:center; justify-content:center }`，
+   * 标题在上、composer 在下、整组居中）。说过话之后输入区沉到底部。
+   */
+  const blank = sid !== null
+    && llmUnavailable !== true
+    && chat !== null
+    && (chat.messages ?? []).length === 0
+    && chat.streaming !== true
+    && (chat.error ?? null) === null;
 
   /**
    *  body 区：没会话 / 没模型 / 正常对话 三态。
@@ -1002,10 +1028,31 @@ export function ChatPane() {
           <ChevronRightIcon size={14} />
         </button>
       </div>
-      <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto' }}>{renderBody()}</div>
+      {/**
+       * 上下两个弹性占位夹住「消息区 + 输入区」：空对话时两者都 grow:1，
+       * 中间那组自然落到垂直中央；有消息后占位收成 0，消息区独占剩余高度、
+       * 输入区贴底。占位始终存在（只换数值）→ composer 在兄弟节点里的
+       * 位置不变，切态不会重挂 textarea，正在打的草稿不会丢。
+       *
+       * 用 flexGrow/flexShrink/flexBasis 长写而不是 flex 简写：简写要过一遍
+       * cssstyle 的语法解析，`1 1 0` 这类无单位 basis 在部分环境会被丢掉。
+       */}
+      <div style={blank ? spacerGrowStyle : spacerCollapsedStyle} aria-hidden="true" />
+      <div
+        style={{
+          flexGrow: blank ? 0 : 1,
+          flexShrink: 1,
+          flexBasis: 'auto',
+          minHeight: 0,
+          overflowY: 'auto',
+        }}
+      >
+        {renderBody()}
+      </div>
       {sid !== null && llmUnavailable !== true ? (
         <ChatComposer sid={sid} streaming={chat?.streaming === true} pending={chat?.pending === true} />
       ) : null}
+      <div style={blank ? spacerGrowStyle : spacerCollapsedStyle} aria-hidden="true" />
     </aside>
   );
 }

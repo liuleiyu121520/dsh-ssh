@@ -85,3 +85,16 @@ export function ChevronRightIcon({ size = 16, ...rest }) {
     </svg>
   );
 }
+
+/**
+ * 下箭头（输入框里的胶囊下拉：模型 / 授权）。
+ * @param {{size?: number}} props 尺寸。
+ * @returns {JSX.Element} SVG 元素。
+ */
+export function ChevronDownIcon({ size = 16, ...rest }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true" {...rest}>
+      <path d="M6 9.5l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}

@@ -48,7 +48,9 @@
     "test:e2e": "node scripts/e2e.mjs"
   },
   "dependencies": {
+    "crc-32": "^1.2.2",
     "ssh2": "1.17.0",
+    "zmodem.js": "^0.1.10",
     "zod": "4.4.3"
   },
   "devDependencies": {

@@ -10,7 +10,7 @@
  * 与启动台的耦合只有一句话：本组件不拿 ctx，数据全走模块级 store。
  */
 import React, { useEffect, useRef, useSyncExternalStore } from 'react';
-import { ChatIcon, ChevronLeftIcon, ChevronRightIcon } from './icons.js';
+import { ChatIcon, ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon } from './icons.js';
 import { actions, getState, subscribe } from './store.js';
 import { t } from './locales.js';
 import { parseMarkdown } from './markdown.js';
@@ -608,6 +608,148 @@ const pillStyle = {
 };
 
 /**
+ * 向上展开的胶囊下拉（模型 / 授权共用）。
+ *
+ * 为什么不用原生 `<select>`：它的展开方向由浏览器和操作系统决定，CSS 管不
+ * 了。右栏的输入区贴着面板底边，向下只有几像素，选项必然被裁掉（2026-10-25
+ * 真机反馈）。改成按钮 + 绝对定位浮层，`bottom: 100%` 保证永远向上弹；列表
+ * 超高时内部滚动，不撑破面板。
+ *
+ * @param {object} props 参数。
+ * @param {string} props.value 当前值。
+ * @param {(value: string) => void} props.onChange 选中回调。
+ * @param {Array<{label: string, options: Array<{value: string, label: string, hint?: string}>}>} props.groups 分组选项。
+ * @param {string} props.title 悬浮提示（同时是 aria-label）。
+ * @returns {JSX.Element} 控件。
+ */
+function UpwardSelect({ value, onChange, groups, title }) {
+  const [open, setOpen] = React.useState(false);
+  const boxRef = React.useRef(null);
+  const current = groups
+    .flatMap((group) => group.options)
+    .find((option) => option.value === value);
+  React.useEffect(() => {
+    if (open !== true) return undefined;
+    /** 指针落在浮层之外就收起（捕获阶段，先于别处的点击处理）。 */
+    const onPointerDown = (event) => {
+      if (boxRef.current !== null && boxRef.current.contains(event.target) !== true) {
+        setOpen(false);
+      }
+    };
+    /** Esc 收起：键盘用户不必找到鼠标。 */
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+  return (
+    <div ref={boxRef} style={{ position: 'relative', minWidth: 0, maxWidth: '46%' }}>
+      <button
+        type="button"
+        onClick={() => setOpen((previous) => previous !== true)}
+        title={title}
+        aria-label={title}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        style={{
+          ...pillStyle,
+          display: 'flex',
+          alignItems: 'center',
+          gap: '3px',
+          width: '100%',
+          maxWidth: '100%',
+        }}
+      >
+        <span
+          style={{
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {current !== undefined ? current.label : title}
+        </span>
+        <ChevronDownIcon size={10} style={{ flex: '0 0 auto' }} />
+      </button>
+      {open === true ? (
+        <div
+          role="listbox"
+          style={{
+            position: 'absolute',
+            // 向上弹：输入区贴面板底边，向下展开必被裁。
+            bottom: 'calc(100% + 4px)',
+            left: 0,
+            minWidth: '180px',
+            maxWidth: '300px',
+            // 列表可能很长（provider × model）：限高 + 内部滚动。
+            maxHeight: '260px',
+            overflowY: 'auto',
+            zIndex: 100,
+            padding: '4px',
+            border: '0.5px solid var(--dsw-alias-border-l3)',
+            borderRadius: '8px',
+            background: 'var(--dsw-alias-bg-layer-3)',
+            boxShadow: '0 6px 20px rgba(0, 0, 0, 0.28)',
+          }}
+        >
+          {groups.map((group) => (
+            <div key={group.label}>
+              <div
+                style={{
+                  padding: '4px 8px 2px',
+                  fontSize: '10px',
+                  lineHeight: '14px',
+                  color: 'var(--dsw-alias-label-quaternary)',
+                }}
+              >
+                {group.label}
+              </div>
+              {group.options.map((option) => {
+                const active = option.value === value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="option"
+                    aria-selected={active}
+                    onClick={() => {
+                      onChange(option.value);
+                      setOpen(false);
+                    }}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      padding: '4px 8px',
+                      border: 'none',
+                      borderRadius: '5px',
+                      cursor: 'pointer',
+                      textAlign: 'left',
+                      font: 'inherit',
+                      fontSize: '11px',
+                      lineHeight: '16px',
+                      color: active === true ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-secondary)',
+                      background: active === true ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+                      fontWeight: active === true ? 600 : 400,
+                    }}
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
  * 输入区：一个盒子 = 输入框 + 底部控件（模型 / 授权 / 发送）。
  *
  * 控件放进盒子里是照 dsh 原生 composer 的排布：模型与授权是"这次对话怎么跑"
@@ -654,39 +796,37 @@ function ChatComposer({ sid, streaming, pending }) {
       />
       <div style={composerRowStyle}>
         {llm.status === 'ready' ? (
-          <select
+          <UpwardSelect
             value={`${llm.picked.provider}::${llm.picked.model}`}
-            onChange={(event) => {
-              const [provider, ...rest] = event.target.value.split('::');
+            onChange={(next) => {
+              const [provider, ...rest] = next.split('::');
               actions.setChatModel(provider, rest.join('::'));
             }}
             title={t('chatModel')}
-            style={pillStyle}
-          >
-            {llm.providers.map((provider) => (
-              <optgroup
-                key={provider.id}
-                label={provider.unavailable !== undefined ? `${provider.name}（${provider.unavailable}）` : provider.name}
-              >
-                {(provider.models ?? []).map((model) => (
-                  <option key={`${provider.id}::${model.id}`} value={`${provider.id}::${model.id}`}>
-                    {model.label !== '' ? model.label : model.id}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
+            groups={llm.providers.map((provider) => ({
+              label: provider.unavailable !== undefined ? `${provider.name}（${provider.unavailable}）` : provider.name,
+              options: (provider.models ?? []).map((model) => ({
+                value: `${provider.id}::${model.id}`,
+                label: model.label !== '' ? model.label : model.id,
+              })),
+            }))}
+          />
         ) : null}
-        <select
+        <UpwardSelect
           value={approval}
-          onChange={(event) => actions.setApproval(event.target.value)}
+          onChange={(next) => actions.setApproval(next)}
           title={t('chatApproval')}
-          style={pillStyle}
-        >
-          <option value="auto">{t('chatApprovalAuto')}</option>
-          <option value="danger">{t('chatApprovalDanger')}</option>
-          <option value="always">{t('chatApprovalAlways')}</option>
-        </select>
+          groups={[
+            {
+              label: t('chatApproval'),
+              options: [
+                { value: 'auto', label: t('chatApprovalAuto') },
+                { value: 'danger', label: t('chatApprovalDanger') },
+                { value: 'always', label: t('chatApprovalAlways') },
+              ],
+            },
+          ]}
+        />
         <span style={{ flex: '1 1 auto' }} />
         {streaming === true ? (
           <button

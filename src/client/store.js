@@ -1119,6 +1119,32 @@ export const actions = {
   },
 
   /**
+   * 视图销毁：启动台协议 `onTeardown` 的处理（关标签 / 启动台卸载都会调）。
+   *
+   * 不处理的后果很直接：Host 侧的 SSH 连接还活着（进程里挂着 socket），
+   * 客户端这侧的 xterm + EventSource 也还挂着——关掉卡片只是看不见了。
+   * 2026-10-25 协议新增 onTeardown，本插件此前未接。
+   *
+   * 顺序有讲究：协议要求 handler **同步返回**（关闭动画不能卡在网络上），
+   * 所以本地状态与 runtime 先归零，关连接的 POST 逐个 fire-and-forget。
+   * @param {string} reason 触发原因（`tab-closed` / `launcher-disposed`）。
+   * @returns {void}
+   */
+  teardownAll(reason) {
+    const sids = state.tabs.slice();
+    // 同步：先停轮询（否则 teardown 后还在打 /hosts），再摘全部 runtime
+    // （EventSource + xterm DOM + 渲染器，一个都不能留），最后状态归零。
+    actions.stopPolling();
+    for (const sid of sids) destroyRuntime(sid);
+    setState({ tabs: [], activeSid: null, sessions: {}, chats: {} });
+    // 异步：逐个通知 Host 关连接。失败无所谓——Host 侧进程退出时这些
+    // 会话反正也没了，本地状态已经不再引用它们。
+    for (const sid of sids) {
+      void actions._request('POST', '/close', { sid }).catch(() => {});
+    }
+  },
+
+  /**
    * 选中一个会话（左栏点击）。
    * @param {string|null} sid 会话 id。
    * @returns {void}

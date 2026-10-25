@@ -5,8 +5,13 @@
  * 高度撑满父容器——启动台协议 §5 明确容器已处理高度与滚动，应用绝不写
  * height:100vh，也不加顶部避让。
  *
- * 本组件与启动台彻底解耦：props 只用 `active`（v1.1 草案的可见性信号），
- * 数据一律走模块级 store。因此它可以被独立渲染、独立单测。
+ * 与启动台的耦合只剩启动台协议承诺的 props（v1.2）：
+ * - `active`  视图可见性。隐藏时停轮询、回来再开——协议 §5 要求靠它降频，
+ *   而不是去读根元素的 hidden 属性；
+ * - `onTeardown(handler)`  关标签 / 启动台卸载前**同步**通知一次，我们借此
+ *   关掉全部 SSH 连接与终端 runtime（不接的后果：连接变成看不见的孤儿）。
+ *
+ * 其余数据一律走模块级 store，所以本组件可以被独立渲染、独立单测。
  */
 import React, { useCallback, useEffect, useSyncExternalStore } from 'react';
 import { actions, getState, subscribe } from './store.js';
@@ -19,10 +24,14 @@ import { t } from './locales.js';
 
 /**
  * SSH 应用视图。
- * @param {{active?: boolean}} props 启动台注入的 props（M0 只用得到 active）。
+ * @param {object} props 启动台注入的 props。
+ * @param {boolean} [props.active] 视图是否可见（v1.1 可见性信号）。
+ * @param {(handler: (detail: {reason: string}) => void) => (() => void)|undefined} [props.onTeardown]
+ *   注册销毁回调（v1.2）：关标签（`tab-closed`）与启动台卸载（`launcher-disposed`）
+ *   前同步调用一次，返回注销函数。老启动台不传，缺省就当没有。
  * @returns {JSX.Element} 三栏布局。
  */
-export function SshAppView({ active: _active = true } = {}) {
+export function SshAppView({ active = true, onTeardown } = {}) {
   const state = useSyncExternalStore(subscribe, getState);
 
   useEffect(() => {
@@ -34,6 +43,25 @@ export function SshAppView({ active: _active = true } = {}) {
       actions.stopPolling();
     };
   }, []);
+
+  // 可见性：协议 §5 的降频点。隐藏时停轮询，重新显示再开（两个函数都幂等）。
+  useEffect(() => {
+    if (active === true) {
+      actions.startPolling();
+    } else {
+      actions.stopPolling();
+    }
+  }, [active]);
+
+  useEffect(() => {
+    // 销毁通知（v1.2）：关标签或启动台卸载时，把连接与 runtime 全部收干净。
+    // handler 同步执行，所以 teardownAll 里只有本地操作，网络请求走
+    // fire-and-forget——关闭动画不该等 HTTP。
+    if (typeof onTeardown !== 'function') return undefined;
+    return onTeardown((detail) => {
+      actions.teardownAll(typeof detail?.reason === 'string' ? detail.reason : '');
+    });
+  }, [onTeardown]);
 
   /**
    * 点左栏某一行：

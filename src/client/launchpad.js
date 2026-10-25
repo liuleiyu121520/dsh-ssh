@@ -4,8 +4,12 @@
  * 只依赖协议 §2 承诺的三件事：
  * 1. `register()` 返回幂等 dispose，必须交给 `ctx.effect`；
  * 2. 容器给 width:100%、高度撑满、overflow:auto、padding 0、继承 --dsw-alias-*；
- * 3. view 的 props 只有 {appId, app, back, open, active, t}，拿不到 ctx——
- *    所以数据一律走我们自己的模块级 store（store.js）。
+ * 3. view 的 props 是 {appId, app, close, onTeardown, open, t, active}——拿不到
+ *    ctx，所以数据一律走我们自己的模块级 store（store.js）。
+ *
+ * `onTeardown`（v1.2 新增）：关标签 / 启动台卸载前同步通知一次，SshAppView
+ * 用它把 SSH 连接与终端 runtime 全部收干净；`close` 留给"结束会话"这类
+ * 插件主动关自己标签的场景（协议注释里的原例就是 SSH）。
  *
  * 启动台改协议时只改这一个文件；SshAppView 本身与启动台无关。
  */

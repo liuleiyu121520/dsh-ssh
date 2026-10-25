@@ -324,12 +324,26 @@ function safeWrite(target, text) {
 }
 
 /**
+ * 通用事件帧：`data: {...}\n\n`，payload 就是事件对象本身。
+ *
+ * **别拿 formatSseFrame 发这类帧**：那个是给终端字节流用的，会把入参当成
+ * `{seq, data}` 打包成 `{seq, chunk}`——传一个 `{type:'transfer',...}` 进去，
+ * 两个字段都取不到，`JSON.stringify` 直接吐 `{}`，客户端只能看到两个空对象
+ * （2026-10-25 真机：rz 有反应、浮层永远不出现，根因就在这里）。
+ * @param {object} event 事件对象。
+ * @returns {string} `data: {...}\n\n`。
+ */
+export function formatEventFrame(event) {
+  return `data: ${JSON.stringify(event)}\n\n`;
+}
+
+/**
  * 把一个对话事件格式化成 SSE 帧。
  * @param {object} event chat 事件（{type, ...}）。
  * @returns {string} `data: {...}\n\n`。
  */
 export function formatChatFrame(event) {
-  return `data: ${JSON.stringify(event)}\n\n`;
+  return formatEventFrame(event);
 }
 
 /**
@@ -488,6 +502,12 @@ export function registerRoutes(ctx, options = {}) {
     if (typeof body.data !== 'string') throw new HttpError(400, 'data must be a base64 string');
     // Buffer.from 对非法 base64 字符是忽略而非抛错，包 try/catch 是死代码。
     const bytes = Buffer.from(body.data, 'base64');
+    // 传输中的 Ctrl+C 翻译成"取消传输"：rz/sz 在 raw 模式下收不到 SIGINT，
+    // 原样写进 PTY 只会让用户对着没反应的终端连按（src/transfer.js 有实测）。
+    if (transfer !== null && transfer.interceptInput(sid, bytes) === true) {
+      sendJson(res, 200, { ok: true, bytes: bytes.length, cancelled: true });
+      return;
+    }
     service.send(sid, bytes);
     sendJson(res, 200, { ok: true, bytes: bytes.length });
   });
@@ -610,7 +630,7 @@ export function registerRoutes(ctx, options = {}) {
     });
     safeWrite(res, ': dsh-ssh transfer events open\n\n');
     const unsubscribe = transfer.onEvent(sid, (event) => {
-      safeWrite(res, formatSseFrame(event));
+      safeWrite(res, formatEventFrame(event));
       // end 是终态：发完就收流，别把 SSE 挂成孤儿。
       if (event?.phase === 'end') {
         try { res.end(); } catch { /* 连接已断 */ }
@@ -624,6 +644,16 @@ export function registerRoutes(ctx, options = {}) {
     req.on('close', teardown);
     res.on('close', teardown);
     res.on('error', teardown);
+  });
+
+  // POST /api/dsh-ssh/transfer/cancel —— 取消进行中的 rz/sz（发 ZMODEM CAN）。
+  register('exact', `${PREFIX}/transfer/cancel`, async (req, res) => {
+    if (req.method !== 'POST') throw new HttpError(405, 'POST only');
+    if (transfer === null) throw new HttpError(501, 'transfer-unavailable');
+    const body = await readJsonBody(req);
+    const sid = requireSid(body.sid);
+    const cancelled = transfer.cancel(sid) === true;
+    sendJson(res, 200, { ok: true, cancelled });
   });
 
   // POST /api/dsh-ssh/transfer/file —— 上传：浏览器选的文件交给协议机。

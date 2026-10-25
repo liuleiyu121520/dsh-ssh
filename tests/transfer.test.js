@@ -118,3 +118,59 @@ test('dispose 清掉全部会话状态', () => {
   transfer.dispose();
   assert.equal(transfer.isActive('s1'), false);
 });
+
+// ── 取消（2026-10-25 用户报：rz 卡住，连续 Ctrl+C 也退不出来） ─────────────
+//
+// rz/sz 一进 ZMODEM 就把终端切成 raw 模式，0x03 只是普通数据字节，既不会
+// 产生 SIGINT 也不会被协议层当取消。真能打断它的是连续 CAN（0x18）：
+// 本机 lrzsz 实测 5 个不够（10 秒不退），8 个 0.9 秒退出。
+
+test('cancel 给远端发一串 CAN，并把会话摘出传输态', () => {
+  const { service, feed, sent } = makeService();
+  const transfer = createTransferManager({ service, logger: () => {} });
+  /** @type {object[]} */
+  const events = [];
+  transfer.onEvent('s1', (event) => events.push(event));
+  transfer.attach('s1');
+  feed(ZRINIT_FRAME);
+  assert.equal(transfer.isActive('s1'), true, '前置：已在等选文件');
+  sent.length = 0;
+
+  const cancelled = transfer.cancel('s1');
+
+  assert.equal(cancelled, true);
+  assert.equal(sent.length, 1, '只发一个写操作');
+  const bytes = sent[0];
+  assert.equal(bytes.length >= 8, true, `CAN 至少 8 个才管用，实际 ${bytes.length}`);
+  assert.equal([...bytes].every((byte) => byte === 0x18), true, '整串必须都是 CAN(0x18)');
+  assert.equal(transfer.isActive('s1'), false, '取消后终端字节流要恢复');
+  assert.deepEqual(events.map((event) => event.phase).slice(-2), ['cancelled', 'end']);
+  transfer.dispose();
+});
+
+test('cancel 对没有传输的会话是空操作', () => {
+  const { service, sent } = makeService();
+  const transfer = createTransferManager({ service, logger: () => {} });
+  transfer.attach('s1');
+  sent.length = 0;
+  assert.equal(transfer.cancel('s1'), false);
+  assert.equal(sent.length, 0, '没有传输时不该往 PTY 灌 CAN');
+  transfer.dispose();
+});
+
+test('传输中 Ctrl+C 被翻译成取消，其余按键不拦', () => {
+  const { service, feed, sent } = makeService();
+  const transfer = createTransferManager({ service, logger: () => {} });
+  transfer.attach('s1');
+
+  // 没有传输时：Ctrl+C 原样放行（正常中断前台进程要靠它）。
+  assert.equal(transfer.interceptInput('s1', Buffer.from([0x03])), false);
+
+  feed(ZRINIT_FRAME);
+  sent.length = 0;
+  assert.equal(transfer.interceptInput('s1', Buffer.from('abc')), false, '普通按键不拦');
+  assert.equal(transfer.interceptInput('s1', Buffer.from([0x03])), true, '传输中的 Ctrl+C 要拦');
+  assert.equal([...sent[0]].every((byte) => byte === 0x18), true, '拦下来之后发的是 CAN 序列');
+  assert.equal(transfer.isActive('s1'), false);
+  transfer.dispose();
+});

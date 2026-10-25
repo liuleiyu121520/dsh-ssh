@@ -56,7 +56,7 @@ async function makeApp(options = {}) {
   const store = options.withStore === false ? null : await new HostStore({ storageDomain, vault }).init();
 
   const ctx = createFakeCtx({ reject: options.reject });
-  registerRoutes(ctx, { service, store, fallbackHosts: options.fallbackHosts ?? [] });
+  registerRoutes(ctx, { service, store, transfer: options.transfer ?? null, fallbackHosts: options.fallbackHosts ?? [] });
   const server = await mountRoutes(ctx);
 
   return {
@@ -762,6 +762,119 @@ test('the connection layer rejection wins over everything (first thing every rou
       const res = await request(`${app.baseUrl}${path}`, { method, body: method === 'POST' ? {} : undefined });
       assert.equal(res.status, 403, `${method} ${path} must be rejected by ctx.connection`);
     }
+  } finally {
+    await app.close();
+  }
+});
+
+// ── 传输控制帧的线路格式（2026-10-25 真机：rz 有反应、浮层永不出现） ─────────
+//
+// 根因是 /transfer/events 用了 `formatSseFrame`——那是给终端字节流用的，
+// 会把入参当 `{seq, data}` 打包成 `{seq, chunk}`。传一个传输事件进去，两个
+// 字段都取不到，`JSON.stringify` 直接吐 `{}`，客户端只收到两个空对象。
+// 这一组用例把"线上到底长什么样"钉住。
+
+test('/transfer/events 发的是原始事件对象，不是 {seq, chunk} 包装', async () => {
+  /** 订阅者句柄：测试里手动推事件。 */
+  let listener = null;
+  const fakeTransfer = {
+    onEvent(sid, callback) {
+      listener = callback;
+      return () => { listener = null; };
+    },
+    isActive: () => true,
+    attach() {},
+    detach() {},
+    dispose() {},
+    cancel: () => false,
+    interceptInput: () => false,
+  };
+  const app = await makeApp({ transfer: fakeTransfer });
+  try {
+    const record = await seedHost(app);
+    const opened = await request(`${app.baseUrl}/api/dsh-ssh/open`, { method: 'POST', body: { hostId: record.id } });
+    const sid = opened.json.sid;
+
+    const streamed = getStream(`${app.baseUrl}/api/dsh-ssh/transfer/events?sid=${sid}`, { autoCloseAfterMs: 400 });
+    // 等订阅挂上再推事件。
+    for (let i = 0; i < 40 && listener === null; i += 1) await new Promise((r) => setTimeout(r, 10));
+    assert.notEqual(listener, null, '订阅必须挂上');
+    listener({ type: 'transfer', phase: 'need-file' });
+    listener({ type: 'transfer', phase: 'start', mode: 'send' });
+    const res = await streamed;
+
+    const frames = parseFrames(res.body);
+    assert.deepEqual(frames, [
+      { type: 'transfer', phase: 'need-file' },
+      { type: 'transfer', phase: 'start', mode: 'send' },
+    ], `事件对象必须原样过线，实际收到 ${JSON.stringify(frames)}`);
+    // 反向守卫：绝不能是 {seq, chunk} 那种空壳。
+    assert.equal(frames.some((frame) => 'chunk' in frame), false, '不能套终端分片的壳');
+  } finally {
+    await app.close();
+  }
+});
+
+test('传输中按 Ctrl+C 走取消，不往 PTY 写 0x03', async () => {
+  /** 记下被拦下的输入。 */
+  const intercepted = [];
+  const fakeTransfer = {
+    onEvent: () => () => {},
+    isActive: () => true,
+    attach() {},
+    detach() {},
+    dispose() {},
+    cancel: () => true,
+    interceptInput(sid, bytes) {
+      intercepted.push({ sid, bytes: [...bytes] });
+      return bytes.includes(0x03);
+    },
+  };
+  const app = await makeApp({ transfer: fakeTransfer });
+  try {
+    const record = await seedHost(app);
+    const opened = await request(`${app.baseUrl}/api/dsh-ssh/open`, { method: 'POST', body: { hostId: record.id } });
+    const sid = opened.json.sid;
+    const transport = app.created.at(-1);
+    transport.sent.length = 0;
+
+    const res = await request(`${app.baseUrl}/api/dsh-ssh/input`, {
+      method: 'POST',
+      body: { sid, data: Buffer.from([0x03]).toString('base64') },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.cancelled, true, 'Ctrl+C 要被翻译成取消');
+    assert.equal(intercepted.length, 1);
+    assert.equal(transport.sent.length, 0, '被拦下的字节不该再写进 PTY');
+
+    // 普通按键照旧进 PTY。
+    await request(`${app.baseUrl}/api/dsh-ssh/input`, { method: 'POST', body: { sid, data: Buffer.from('ls\n').toString('base64') } });
+    assert.equal(Buffer.concat(transport.sent).toString('utf8'), 'ls\n');
+  } finally {
+    await app.close();
+  }
+});
+
+test('POST /transfer/cancel 转发给协议机并回 cancelled', async () => {
+  const cancelledSids = [];
+  const fakeTransfer = {
+    onEvent: () => () => {},
+    isActive: () => true,
+    attach() {},
+    detach() {},
+    dispose() {},
+    cancel(sid) { cancelledSids.push(sid); return true; },
+    interceptInput: () => false,
+  };
+  const app = await makeApp({ transfer: fakeTransfer });
+  try {
+    const record = await seedHost(app);
+    const opened = await request(`${app.baseUrl}/api/dsh-ssh/open`, { method: 'POST', body: { hostId: record.id } });
+    const sid = opened.json.sid;
+    const res = await request(`${app.baseUrl}/api/dsh-ssh/transfer/cancel`, { method: 'POST', body: { sid } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json, { ok: true, cancelled: true });
+    assert.deepEqual(cancelledSids, [sid]);
   } finally {
     await app.close();
   }

@@ -1200,19 +1200,40 @@ export const actions = {
         return; // 心跳注释帧等非 JSON：忽略。
       }
       if (payload?.type !== 'transfer') return;
-      const transfers = { ...state.transfers, [sid]: { ...payload } };
-      setState({ transfers });
-      // end 是终态：留一小会儿让用户看到结果，然后收回浮层。
+      const previous = state.transfers[sid];
+      setState({ transfers: { ...state.transfers, [sid]: { ...payload } } });
+      // end 是终态：只有"传输完成"值得多留 4 秒让用户看到文件名/下载链接；
+      // 取消、失败、空转立刻收走——否则浮层会变成一个什么都不显示的空盒子
+      // 挂在终端上（TransferBar 对 end 没有任何分支）。
       if (payload.phase === 'end') {
-        setTimeout(() => {
-          if (state.transfers[sid]?.phase === 'end') {
-            const next = { ...state.transfers };
-            delete next[sid];
-            setState({ transfers: next });
-          }
-        }, 4000);
+        /** 把这条浮层摘掉（期间可能又开始了新传输，用 phase 比对身份）。 */
+        const clear = () => {
+          if (state.transfers[sid]?.phase !== 'end') return;
+          const next = { ...state.transfers };
+          delete next[sid];
+          setState({ transfers: next });
+        };
+        if (previous?.phase === 'complete') setTimeout(clear, 4000);
+        else clear();
       }
     });
+  },
+
+  /**
+   * 取消进行中的传输（浮层上的「取消」按钮）。
+   *
+   * Host 侧发 ZMODEM 的 CAN 序列，远端 rz/sz 会立刻退出（实测 0.9s）。
+   * 不用 Ctrl+C：raw 模式下它只是个数据字节。
+   * @param {string} sid 会话 id。
+   * @returns {Promise<void>}
+   */
+  async cancelTransfer(sid) {
+    if (typeof sid !== 'string' || sid === '') return;
+    try {
+      await actions._request('POST', '/transfer/cancel', { sid });
+    } catch {
+      // 取消失败也无所谓：浮层照样会被 end 事件收走。
+    }
   },
 
   /**

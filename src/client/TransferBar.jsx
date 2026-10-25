@@ -58,6 +58,9 @@ function humanSize(bytes) {
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/** 浮层有意义的阶段；其余（尤其 `end`）一律不渲染，避免留一个空盒子。 */
+const KNOWN_PHASES = new Set(['need-file', 'sending', 'progress', 'offer', 'complete', 'error', 'cancelled']);
+
 /**
  * 传输浮层。
  * @param {{sid: string, transfer: object}} props 会话 id 与传输状态。
@@ -69,10 +72,32 @@ export function TransferBar({ sid, transfer }) {
   if (transfer === undefined || transfer === null) return null;
 
   const phase = transfer.phase;
+  // 未知/中间态（尤其 `end`）不画任何东西：留一个空盒子比不显示更糟。
+  if (KNOWN_PHASES.has(phase) === false) return null;
   const percent = transfer.size > 0 ? Math.min(1, (transfer.offset ?? 0) / transfer.size) : 0;
 
   /** 打开文件选择框（need-file 阶段专用）。 */
   const pick = () => fileInput.current?.click();
+  /** 取消按钮：走 Host 的 CAN 序列，远端 rz/sz 立刻退出。 */
+  const cancelButton = (
+    <button
+      type="button"
+      onClick={() => void actions.cancelTransfer(sid)}
+      title="取消传输（等同 Ctrl+C）"
+      style={{
+        padding: '3px 8px',
+        border: '0.5px solid var(--dsw-alias-border-l2)',
+        borderRadius: '5px',
+        cursor: 'pointer',
+        font: 'inherit',
+        fontSize: '11px',
+        color: 'var(--dsw-alias-label-tertiary)',
+        background: 'transparent',
+      }}
+    >
+      取消
+    </button>
+  );
 
   return (
     <div style={barStyle} role="status">
@@ -95,6 +120,7 @@ export function TransferBar({ sid, transfer }) {
           >
             选择文件
           </button>
+          {cancelButton}
           <input
             ref={fileInput}
             type="file"
@@ -115,10 +141,18 @@ export function TransferBar({ sid, transfer }) {
             <div style={fillStyle(percent)} />
           </div>
           <span>{humanSize(transfer.offset ?? 0)} / {humanSize(transfer.size ?? 0)}</span>
+          {cancelButton}
         </>
       ) : null}
 
-      {phase === 'offer' ? <span>对端发送 {transfer.name ?? ''}（{humanSize(transfer.size ?? 0)}）…</span> : null}
+      {phase === 'offer' ? (
+        <>
+          <span>对端发送 {transfer.name ?? ''}（{humanSize(transfer.size ?? 0)}）…</span>
+          {cancelButton}
+        </>
+      ) : null}
+
+      {phase === 'cancelled' ? <span>已取消传输</span> : null}
 
       {phase === 'complete' ? (
         transfer.mode === 'receive' ? (

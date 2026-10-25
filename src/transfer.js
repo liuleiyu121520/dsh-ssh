@@ -48,6 +48,16 @@ const CHUNK_BYTES = 8192;
 const PICK_FILE_TIMEOUT_MS = 60000;
 /** 接收文件的临时目录。 */
 const TRANSFER_DIR = join(tmpdir(), 'dsh-ssh-transfers');
+/**
+ * 取消传输时发给远端的 CAN 字节数。
+ *
+ * ZMODEM 的取消序列是连续 CAN（0x18）。**实测**（本机 lrzsz，pty 直连）：
+ * 5 个不够——rz 收下后照旧重试，10 秒都不退；8 个 0.9 秒就退出（exit 128）。
+ * 多给两个当余量。
+ */
+const CANCEL_BYTES = 10;
+/** CAN 控制字符。 */
+const CAN = 0x18;
 
 /**
  * 把对端给的文件名洗成安全的单段名。
@@ -338,6 +348,54 @@ export function createTransferManager(options = {}) {
   };
 
   /**
+   * 取消当前传输：发 ZMODEM 取消序列，让远端的 rz/sz 立刻退出。
+   *
+   * 为什么不能用 Ctrl+C：rz/sz 一开始就把终端切成 raw 模式，0x03 只是普通
+   * 数据字节，既不会产生 SIGINT 也不会被 ZMODEM 解析（实测连按多次也退不出，
+   * 2026-10-25 用户报"连续 control+c 什么也无法退出"）。能真正打断它的是
+   * 连续 CAN。
+   * @param {string} sid 会话 id。
+   * @returns {boolean} 确实取消了一个进行中的传输时返回 true。
+   */
+  const cancel = (sid) => {
+    const context = contexts.get(sid);
+    // 没有进行中的传输就什么都不做：往一个正常 shell 里灌 CAN 是无意义的噪音。
+    if (context === undefined || context.session === null) return false;
+    const mode = context.mode;
+    // 先把远端劝退：它退出时的那串 CAN/BS 会随字节流回到终端，正好是
+    // 用户想看到的"回到 shell 了"。
+    try {
+      service.send(sid, Buffer.alloc(CANCEL_BYTES, CAN));
+    } catch (error) {
+      logger(`transfer: cannot send cancel to ${sid}: ${error?.message ?? error}`);
+    }
+    emit(sid, { type: 'transfer', phase: 'cancelled', mode });
+    emit(sid, { type: 'transfer', phase: 'end', mode });
+    // settle 会清掉"等用户选文件"的定时器并把 session 置空 → isActive 变
+    // false，终端字节流立刻恢复（否则远端 rz 的退出输出会被一直挡在门外）。
+    settle(sid);
+    return true;
+  };
+
+  /**
+   * 传输期间拦一下键盘输入：**Ctrl+C = 取消传输**。
+   *
+   * 用户面对"卡住的 rz"第一反应就是按 Ctrl+C。与其让他们对着没反应的终端，
+   * 不如把它翻译成真正的取消（这也正是 Xshell 一类客户端的行为）。
+   * @param {string} sid 会话 id。
+   * @param {Buffer|Uint8Array} bytes 用户输入的原始字节。
+   * @returns {boolean} 已消费（调用方不要再往 PTY 写）时返回 true。
+   */
+  const interceptInput = (sid, bytes) => {
+    const context = contexts.get(sid);
+    if (context === undefined || context.session === null) return false;
+    const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes ?? []);
+    if (buffer.includes(0x03) === false) return false;
+    cancel(sid);
+    return true;
+  };
+
+  /**
    * 全部收尾（插件卸载）。
    * @returns {void}
    */
@@ -347,5 +405,5 @@ export function createTransferManager(options = {}) {
     listeners.clear();
   };
 
-  return { attach, detach, isActive, onEvent, sendFile, readReceived, dispose };
+  return { attach, detach, isActive, onEvent, sendFile, readReceived, cancel, interceptInput, dispose };
 }

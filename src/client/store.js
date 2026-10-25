@@ -843,6 +843,24 @@ let toastTimer = null;
 let pollTimer = null;
 
 /**
+ * 把"连不上"的原因写进终端（红字 + 一行提示）。
+ *
+ * 只在这条会话**还没有任何输出**时写提示语：连上过再断开（远端 `exit`、
+ * 网络抖动）时屏幕本来就有内容，用户知道刚才发生了什么，不需要再教一遍。
+ * 无论哪种情况，原因那一行都写——它是用户唯一能拿到的诊断信息。
+ * @param {object} rt 运行时。
+ * @param {string} reason 失败原因（Host 侧 errorText 的结果）。
+ * @returns {void}
+ */
+function writeFailure(rt, reason) {
+  const hint = rt.seq === 0
+    ? '\x1b[2m检查主机地址 / 端口 / 凭据；若远端开启了 fail2ban 一类的爆破保护，'
+      + '本机 IP 可能已被封，需先在服务器上解封。\x1b[0m\r\n'
+    : '';
+  rt.term.write(`\r\n\x1b[31m✗ 连接失败：${reason}\x1b[0m\r\n${hint}`);
+}
+
+/**
  * 连（或重连）某个运行时的 SSE 流。
  *
  * 断线不依赖 EventSource 自带重连：那会用初始 URL（since=0）全量重放。
@@ -890,9 +908,21 @@ function connectStream(rt) {
   });
 
   // 会话终结：主机侧发了 exit，重连没有意义，停在最后一屏。
-  source.addEventListener('exit', () => {
+  // 带 reason 的 exit 是**连不上**（握手失败 / 认证失败 / 端口拒连），这时
+  // 缓冲里一个字节都没有，终端就是一块黑屏——用户只能猜"是不是卡了"
+  // （2026-10-25 真机：远端 22 端口接受 TCP 后立刻断开，界面全黑，用户报
+  // "双击连接不上"）。所以把原因直接写到终端里，黑屏不再是静默失败。
+  source.addEventListener('exit', (event) => {
     source.close();
     rt.es = null;
+    let frame = null;
+    try {
+      frame = JSON.parse(event.data);
+    } catch {
+      // 帧坏了也照旧收流：至少不会崩。
+    }
+    const reason = typeof frame?.reason === 'string' ? frame.reason.trim() : '';
+    if (reason !== '') writeFailure(rt, reason);
   });
 
   source.onerror = () => {

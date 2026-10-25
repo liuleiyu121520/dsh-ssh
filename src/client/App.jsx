@@ -87,11 +87,31 @@ export function SshAppView({ active = true, onTeardown } = {}) {
   }, []);
 
   /**
-   * 双击主机 / 点「+ 标签」：连接（已有会话则聚焦，没有就新开）。
+   * 双击主机 / 点「+ 标签」：连接。
+   *
+   * 双击的语义是"连这台机器"，不是"再开一个标签"：该主机已有活着的会话
+   * （open / connecting）就聚焦它，没有（或上次连失败了）才新建。
+   * 需要第二个标签时走标签条上的 `+` 或主机行的 `+` 按钮。
+   *
+   * 为什么不无脑新建：连不上时用户会连点几次双击，每点一次多一个黑屏标签，
+   * 而且"上次那个报错"被顶到看不见的地方（2026-10-25 真机）。
    * @param {string} hostId Host id。
    * @returns {void}
    */
   const handleOpenTab = useCallback((hostId) => {
+    const live = Object.values(getState().sessions).find(
+      (session) => session?.host?.id === hostId
+        && (session.status === 'open' || session.status === 'connecting'),
+    );
+    if (live !== undefined && typeof live.sid === 'string') {
+      actions.ensureTab(live.sid);
+      actions.setActiveSid(live.sid);
+      return;
+    }
+    void actions.openSession(hostId);
+  }, []);
+
+  const handleNewTabFor = useCallback((hostId) => {
     void actions.openSession(hostId);
   }, []);
 
@@ -140,6 +160,7 @@ export function SshAppView({ active = true, onTeardown } = {}) {
           onSelect={handleSelect}
           onAdd={handleAdd}
           onOpenTab={handleOpenTab}
+          onNewTab={handleNewTabFor}
           onEdit={handleEdit}
           onDelete={handleDelete}
           onCollapse={actions.toggleHosts}

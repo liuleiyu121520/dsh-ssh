@@ -9,8 +9,9 @@
  * `systemPrompt`）各自在自己的 `ctx.inject` 里挂载，缺哪个就只降级哪一半——
  * 一个服务没装不该让整个插件消失。
  *
- * `autoOpenFirst`（设计 §2.3 / §7.10）只在**一个会话都没有**时生效：插件激活
- * 时用户已经手动关完了标签，重启插件不该又把终端弹回来。
+ * `autoOpenFirst`（设计 §2.3 / §7.10）默认**关**，只有显式写 `true` 才生效，
+ * 且只在**一个会话都没有**时生效：插件激活时用户已经手动关完了标签，重启插件
+ * 不该又把终端弹回来。
  */
 import { SshSessionService } from './sessions.js';
 import { createSsh2Transport } from './transport.js';
@@ -157,10 +158,19 @@ export async function apply(ctx, config = {}) {
 
   /**
    * 无会话时自动打开第一台已保存的主机。
+   *
+   * **默认关，且必须显式写 `true` 才开。** 早先写的是 `=== false` 才跳过，
+   * 于是"配置里没这个字段"= 自动开——而 profile 的 cordis.patch.yml 按 id
+   * 打补丁时 `config` 是**整块替换**（vendor/include 的 applyEntryPatches：
+   * `target[key] = value`），一条 `config: {enabled: true}` 就会把 bundle
+   * patch 里的 `autoOpenFirst: false` 一起抹掉。真机表现：第一次进 SSH
+   * 卡片就自动多出一个"腾讯云 #1"标签（2026-10-25 用户报）。
+   * 进应用不自动连是明确的产品要求（单击只选中、双击才连），所以默认值
+   * 只能是关。
    * @returns {Promise<void>} 完成即 resolve。
    */
   const autoOpenFirst = async () => {
-    if (config.autoOpenFirst === false) return;
+    if (config.autoOpenFirst !== true) return;
     // 只在"一个会话都没有"时生效：用户手动关完了标签就别再自动重连。
     if (service.list().length > 0) return;
     const store = state.store;

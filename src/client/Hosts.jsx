@@ -83,11 +83,12 @@ const actionButtonStyle = {
  * 一行主机（含 hover 操作与删除二次确认）。
  *
  * 交互（2026-10-24 用户要求）：单击只选中高亮（已有会话则聚焦其标签），
- * **双击才发起连接**——避免进应用就顺手连上。
- * @param {{host: object, active: boolean, selected: boolean, gap: object|null, onSelect: (host: object) => void, onOpenTab: (hostId: string) => void, onEdit: (host: object) => void, onDelete: (host: object) => void}} props 行数据。
+ * **双击才发起连接**——避免进应用就顺手连上。行内 `+` 是"再开一个标签"，
+ * 与双击不同：双击有活会话就聚焦，`+` 总是新建（一主机多会话）。
+ * @param {{host: object, active: boolean, selected: boolean, gap: object|null, onSelect: (host: object) => void, onOpenTab: (hostId: string) => void, onNewTab: (hostId: string) => void, onEdit: (host: object) => void, onDelete: (host: object) => void}} props 行数据。
  * @returns {JSX.Element} 主机行。
  */
-function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onEdit, onDelete }) {
+function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onNewTab, onEdit, onDelete }) {
   const [hover, setHover] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const color = LIGHT_COLORS[host.status] ?? LIGHT_COLORS.offline;
@@ -167,7 +168,7 @@ function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onE
             type="button"
             title={t('hostOpenTab')}
             aria-label={t('hostOpenTab')}
-            onClick={() => onOpenTab(host.id)}
+            onClick={() => onNewTab(host.id)}
             style={actionButtonStyle}
           >
             <PlusIcon size={12} />
@@ -252,7 +253,7 @@ function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onE
  * @param {{hosts: object[], activeSid: string|null, gaps?: object, onSelect: (host: object) => void, onAdd: () => void, onOpenTab: (hostId: string) => void, onEdit: (host: object) => void, onDelete: (host: object) => void}} props 组件参数。
  * @returns {JSX.Element} 左栏。
  */
-export function Hosts({ hosts, activeSid, gaps = {}, selectedHostId = null, onSelect, onAdd, onOpenTab, onEdit, onDelete, onCollapse }) {
+export function Hosts({ hosts, activeSid, gaps = {}, selectedHostId = null, onSelect, onAdd, onOpenTab, onNewTab, onEdit, onDelete, onCollapse }) {
   return (
     <aside
       style={{
@@ -316,6 +317,7 @@ export function Hosts({ hosts, activeSid, gaps = {}, selectedHostId = null, onSe
               gap={host.sid === null ? null : (gaps[host.sid] ?? null)}
               onSelect={onSelect}
               onOpenTab={onOpenTab}
+              onNewTab={onNewTab}
               onEdit={onEdit}
               onDelete={onDelete}
             />

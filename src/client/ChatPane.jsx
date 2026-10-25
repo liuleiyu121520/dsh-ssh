@@ -942,13 +942,31 @@ function ChatComposer({ sid, streaming, pending }) {
 }
 
 /**
- * 空对话时的弹性占位：吃掉一半剩余空间，把「建议 + 输入区」顶到垂直中央。
- * 与 `spacerCollapsedStyle` 成对出现——两个占位节点始终在 DOM 里，只换尺寸，
- * 这样 composer 的兄弟位置不变，切换态不会重挂输入框。
+ * 空对话时输入区落在**约 1/3 高度**处，不是垂直正中（2026-10-25 用户定）。
+ *
+ * 为什么不是正中：输入区上面还有推荐内容（副标题 + 三条建议），它们把输入框
+ * 往下推。把「推荐 + 输入」整组居中，输入框实际会掉到 55%~65%，看着像贴底。
+ *
+ * 几何账：整组高度 H ≈ 300px（副标题 38 + 提示 14 + 三条建议 108 + 输入框
+ * 106 + 边距），输入框中心 ≈ 顶部留白 + H − 53。要让它落在面板高度 1/3
+ * （760px 高约 250px 处），顶部留白只能是几像素——也就是「推荐内容紧贴头部、
+ * 输入框正好压在 1/3 线上、下面三分之二留给对话往上长」。面板矮时整组先被压
+ * （消息区 flexShrink:1 + overflow auto 兜底），不会溢出。
  */
-const spacerGrowStyle = { flexGrow: 1, flexShrink: 1, flexBasis: 0, minHeight: 0 };
+const EMPTY_TOP_GAP = 8;
 
-/** 有消息时的占位：高度归零（消息区自己吃满剩余高度）。 */
+/** 空对话时的上留白：几像素，把整组顶到头部下方。 */
+const spacerEmptyTopStyle = { flexGrow: 0, flexShrink: 0, flexBasis: EMPTY_TOP_GAP, minHeight: 0 };
+
+/** 空对话时的下留白：吃掉剩下的全部高度，消息区就停在内容高度上。 */
+const spacerEmptyBottomStyle = { flexGrow: 1, flexShrink: 1, flexBasis: 0, minHeight: 0 };
+
+/**
+ * 有消息时两个占位都收成 0（消息区自己 flexGrow:1 吃满剩余高度）。
+ *
+ * 占位节点**始终在 DOM 里**、只换尺寸，是为了让 composer 的兄弟位置不变：
+ * 切态时 React 不会重挂 textarea，用户正在打的草稿不会丢。
+ */
 const spacerCollapsedStyle = { flexGrow: 0, flexShrink: 0, flexBasis: 0, minHeight: 0 };
 
 /**
@@ -970,9 +988,8 @@ export function ChatPane() {
   /**
    * 空对话：还没说过一句话（也没在跑、也没报错）。
    *
-   * 这一态下输入区要**垂直居中**——对齐 dsh 原生新会话页（skeleton/HeroShell
-   * 的 `.root { height:100%; align-items:center; justify-content:center }`，
-   * 标题在上、composer 在下、整组居中）。说过话之后输入区沉到底部。
+   * 这一态下输入区落在面板**约 1/3 高度**处（不是垂直正中）：上面是推荐内容，
+   * 下面三分之二留给对话往上长。说过话之后输入区沉到底部。
    */
   const blank = sid !== null
     && llmUnavailable !== true
@@ -1029,15 +1046,15 @@ export function ChatPane() {
         </button>
       </div>
       {/**
-       * 上下两个弹性占位夹住「消息区 + 输入区」：空对话时两者都 grow:1，
-       * 中间那组自然落到垂直中央；有消息后占位收成 0，消息区独占剩余高度、
-       * 输入区贴底。占位始终存在（只换数值）→ composer 在兄弟节点里的
-       * 位置不变，切态不会重挂 textarea，正在打的草稿不会丢。
+       * 上下两个占位夹住「消息区 + 输入区」：
+       * - 空对话：上留白几像素、下留白吃掉全部剩余高度 → 推荐内容贴着头部，
+       *   输入区落在面板约 1/3 处，下面三分之二留给对话往上长。
+       * - 有消息：两个占位都归零，消息区 flexGrow:1 吃满、输入区贴底。
        *
        * 用 flexGrow/flexShrink/flexBasis 长写而不是 flex 简写：简写要过一遍
        * cssstyle 的语法解析，`1 1 0` 这类无单位 basis 在部分环境会被丢掉。
        */}
-      <div style={blank ? spacerGrowStyle : spacerCollapsedStyle} aria-hidden="true" />
+      <div style={blank ? spacerEmptyTopStyle : spacerCollapsedStyle} aria-hidden="true" />
       <div
         style={{
           flexGrow: blank ? 0 : 1,
@@ -1052,7 +1069,7 @@ export function ChatPane() {
       {sid !== null && llmUnavailable !== true ? (
         <ChatComposer sid={sid} streaming={chat?.streaming === true} pending={chat?.pending === true} />
       ) : null}
-      <div style={blank ? spacerGrowStyle : spacerCollapsedStyle} aria-hidden="true" />
+      <div style={blank ? spacerEmptyBottomStyle : spacerCollapsedStyle} aria-hidden="true" />
     </aside>
   );
 }

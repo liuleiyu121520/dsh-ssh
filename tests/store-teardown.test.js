@@ -154,3 +154,63 @@ test('teardownAll 是幂等的：没有会话时再调一次不炸也不发请�
   await Promise.resolve();
   assert.equal(requests.filter((row) => row.method === 'POST').length, 0);
 });
+
+// ── teardownForReason：按 reason 分流（2026-10-25 真机） ──────────────────
+//
+// 启动台把页面整个卸载时也会调 onTeardown（reason `launcher-disposed`）——
+// 切到别的会话就触发。那不是"用户不要连接了"，一律 teardownAll 会让
+// "打开标签 → 切走 → 切回来" 的连接与屏幕全部丢失。
+
+test('teardownForReason：launcher-disposed 不动连接与标签', async () => {
+  await boot();
+  await actions.openSession('h-1');
+  const before = getState();
+  assert.equal(before.tabs.length, 1, '前置：有一个标签');
+
+  requests.length = 0;
+  actions.teardownForReason('launcher-disposed');
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(
+    requests.filter((row) => row.method === 'POST' && row.path.endsWith('/close')).length,
+    0,
+    '页面卸载不能关 SSH 连接',
+  );
+  const after = getState();
+  assert.deepEqual(after.tabs, before.tabs, '标签要留着');
+  assert.equal(after.activeSid, before.activeSid, '激活会话要留着');
+  assert.notDeepEqual(after.sessions, {}, '会话索引要留着');
+});
+
+test('teardownForReason：tab-closed 才真拆', async () => {
+  await boot();
+  await actions.openSession('h-2');
+  const sids = getState().tabs.slice();
+  assert.ok(sids.length > 0, '前置：有标签');
+
+  requests.length = 0;
+  actions.teardownForReason('tab-closed');
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(
+    requests.filter((row) => row.method === 'POST' && row.path.endsWith('/close')).length,
+    sids.length,
+    '关卡片要把每个会话都关掉',
+  );
+  assert.deepEqual(getState().tabs, [], '状态归零');
+});
+
+test('teardownForReason：未知 reason 保守不动', async () => {
+  await boot();
+  await actions.openSession('h-1');
+  requests.length = 0;
+  actions.teardownForReason('');
+  await Promise.resolve();
+  assert.equal(requests.filter((row) => row.method === 'POST').length, 0);
+  assert.equal(getState().tabs.length, 1);
+  // 收尾：别把状态留给后续用例。
+  actions.teardownAll('tab-closed');
+  await Promise.resolve();
+});

@@ -8,8 +8,9 @@
  * 与启动台的耦合只剩启动台协议承诺的 props（v1.2）：
  * - `active`  视图可见性。隐藏时停轮询、回来再开——协议 §5 要求靠它降频，
  *   而不是去读根元素的 hidden 属性；
- * - `onTeardown(handler)`  关标签 / 启动台卸载前**同步**通知一次，我们借此
- *   关掉全部 SSH 连接与终端 runtime（不接的后果：连接变成看不见的孤儿）。
+ * - `onTeardown(handler)`  关标签 / 启动台卸载前**同步**通知一次。只有
+ *   `tab-closed`（用户真关了卡片）才断连接、销毁 runtime；`launcher-disposed`
+ *   是宿主把页面卸载了（切会话就触发），必须保活——见 store.teardownForReason。
  *
  * 其余数据一律走模块级 store，所以本组件可以被独立渲染、独立单测。
  */
@@ -54,12 +55,16 @@ export function SshAppView({ active = true, onTeardown } = {}) {
   }, [active]);
 
   useEffect(() => {
-    // 销毁通知（v1.2）：关标签或启动台卸载时，把连接与 runtime 全部收干净。
-    // handler 同步执行，所以 teardownAll 里只有本地操作，网络请求走
+    // 销毁通知（v1.2）：关卡片或启动台卸载时，把连接与 runtime 全部收干净。
+    // handler 同步执行，所以 teardown 里只有本地操作，网络请求走
     // fire-and-forget——关闭动画不该等 HTTP。
+    //
+    // **只有 `tab-closed` 才真拆**：`launcher-disposed` 只是宿主把启动台
+    // 页面卸载了（切到别的会话就触发），连接要留着——回来时终端屏幕还在。
+    // 具体取舍写在 store.teardownForReason 的注释里。
     if (typeof onTeardown !== 'function') return undefined;
     return onTeardown((detail) => {
-      actions.teardownAll(typeof detail?.reason === 'string' ? detail.reason : '');
+      actions.teardownForReason(typeof detail?.reason === 'string' ? detail.reason : '');
     });
   }, [onTeardown]);
 

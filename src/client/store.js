@@ -1229,7 +1229,29 @@ export const actions = {
   },
 
   /**
-   * 视图销毁：启动台协议 `onTeardown` 的处理（关标签 / 启动台卸载都会调）。
+   * 启动台 `onTeardown` 的**策略**：按 reason 决定到底要不要拆。
+   *
+   * 两种 reason 语义完全不同，不能一视同仁（2026-10-25 真机踩到）：
+   * - `tab-closed`：用户真的关掉了这张卡片（点 ✕ 或插件自己 `props.close()`）。
+   *   卡片没了，终端也就没有容身处，连接与 runtime 必须收干净；
+   * - `launcher-disposed`：**宿主把启动台页面整个卸载了**——切到别的会话 /
+   *   别的全局面板都会触发（dsh-launchpad/src/page.js:751 的 unmount effect）。
+   *   这**不是**用户不要这些连接了，恰恰是三层保活（设计 §2.5）要兜住的场景：
+   *   store / runtime 都是模块级的，就为了活过 view 卸载。之前一律
+   *   teardownAll，导致"打开标签 → 切到别的会话 → 切回来连接全没了"。
+   *
+   * 所以只有 `tab-closed` 才真拆；`launcher-disposed` 什么都不做——轮询会由
+   * SshAppView 自己的 unmount cleanup 停掉，回来时 loadHosts + startPolling
+   * 重新接上，标签、终端屏幕、SSE 续传位置（rt.seq）全都还在。
+   * @param {string} reason 触发原因（`tab-closed` / `launcher-disposed`）。
+   * @returns {void}
+   */
+  teardownForReason(reason) {
+    if (reason === 'tab-closed') actions.teardownAll(reason);
+  },
+
+  /**
+   * 视图销毁：启动台协议 `onTeardown` 的处理（**只在卡片真被关掉时**调）。
    *
    * 不处理的后果很直接：Host 侧的 SSH 连接还活着（进程里挂着 socket），
    * 客户端这侧的 xterm + EventSource 也还挂着——关掉卡片只是看不见了。

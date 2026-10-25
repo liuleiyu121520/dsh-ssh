@@ -590,8 +590,67 @@ const composerRowStyle = {
   display: 'flex',
   alignItems: 'center',
   gap: '4px',
-  minHeight: '26px',
+  minHeight: '28px',
 };
+
+/**
+ * 发送 / 停止按钮：照抄 dsh 原生 composer 的主按钮
+ * （ui-conversation/src/client/skeleton/InputBar.module.css `.primary`）。
+ *
+ * 原生是 34px 圆形、`--dsw-alias-button-info-fill` 底色、白图标、禁用 0.4
+ * 透明；这里收到 28px 是因为右栏只有 360px、且控件行本来就矮，但形状、色
+ * 值、禁用态全部同源。**一个按钮两个含义**：空闲是箭头（发送），在跑是圆
+ * 角方块（停止）——原生也是这么切的，不再并排两个文字按钮（2026-10-25
+ * 真机：右栏太窄，"停止""发送"被挤成两行竖排）。
+ */
+const primaryButtonStyle = {
+  display: 'grid',
+  placeItems: 'center',
+  flex: '0 0 auto',
+  width: '28px',
+  height: '28px',
+  padding: 0,
+  border: 'none',
+  borderRadius: '999px',
+  background: 'var(--dsw-alias-button-info-fill)',
+  // 固定白，不用前景 token：蓝底上的箭头在明暗两套主题里都得是白的。
+  color: '#fff',
+  cursor: 'pointer',
+  transition: 'background-color 100ms ease',
+};
+
+/** 悬停/禁用的伪类只能用样式表——原生同款 hover 值，注入一次。 */
+const primaryButtonCss = `
+.dsh-ssh-primary:hover:not(:disabled) { background: var(--dsw-alias-button-info-hover); }
+.dsh-ssh-primary:disabled { opacity: 0.4; cursor: default; }
+`;
+if (typeof document !== 'undefined' && document.getElementById('dsh-ssh-primary-css') === null) {
+  const style = document.createElement('style');
+  style.id = 'dsh-ssh-primary-css';
+  style.textContent = primaryButtonCss;
+  document.head.appendChild(style);
+}
+
+/** 发送图标（向上箭头）：路径取自 dsh 原生 composer 的同一个 SVG。 */
+function SendGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+      <path
+        d="M8.3125 0.980183C8.66767 1.0531 8.97902 1.20418 9.2627 1.43233C9.48724 1.61297 9.73029 1.85793 9.97949 2.10714L14.707 6.83468L13.293 8.24874L9 3.95577V15.0417H7V3.95577L2.70703 8.24874L1.29297 6.83468L6.02051 2.10714C6.26971 1.85793 6.51277 1.61297 6.7373 1.43233C6.97662 1.23986 7.28445 1.04402 7.6875 0.980183C7.8973 0.947006 8.1031 0.95516 8.3125 0.980183Z"
+        fill="currentColor"
+      />
+    </svg>
+  );
+}
+
+/** 停止图标（圆角方块）：与原生 composer 的停止图标同源。 */
+function StopGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+      <rect x="3" y="3" width="10" height="10" rx="3" fill="currentColor" />
+    </svg>
+  );
+}
 
 /** 控件胶囊（模型 / 授权）：小、低对比、不抢输入区的视觉重心。 */
 const pillStyle = {
@@ -828,44 +887,35 @@ function ChatComposer({ sid, streaming, pending }) {
           ]}
         />
         <span style={{ flex: '1 1 auto' }} />
+        {/**
+         * 一个图标按钮，两个含义（与 dsh 原生 composer 一致）：
+         * 在跑 → 方块（停止）；空闲 → 箭头（发送，空草稿时禁用）。
+         * 不再并排两个文字按钮：右栏 360px 里"停止""发送"会被挤成竖排。
+         */}
         {streaming === true ? (
           <button
             type="button"
+            className="dsh-ssh-primary"
             onClick={actions.stopChat}
-            style={{
-              height: '24px',
-              padding: '0 10px',
-              border: '0.5px solid var(--dsw-alias-border-l2)',
-              borderRadius: '6px',
-              cursor: 'pointer',
-              font: 'inherit',
-              fontSize: '11px',
-              color: 'var(--dsw-alias-label-tertiary)',
-              background: 'transparent',
-            }}
+            title={t('chatStop')}
+            aria-label={t('chatStop')}
+            style={primaryButtonStyle}
           >
-            {t('chatStop')}
+            <StopGlyph />
           </button>
-        ) : null}
-        <button
-          type="button"
-          onClick={submit}
-          disabled={canSend === false}
-          style={{
-            height: '24px',
-            padding: '0 12px',
-            border: 'none',
-            borderRadius: '6px',
-            cursor: canSend === true ? 'pointer' : 'default',
-            font: 'inherit',
-            fontSize: '11px',
-            color: 'var(--dsw-alias-label-primary-foreground)',
-            background: 'var(--dsw-alias-brand-primary)',
-            opacity: canSend === true ? 1 : 0.4,
-          }}
-        >
-          {t('chatSend')}
-        </button>
+        ) : (
+          <button
+            type="button"
+            className="dsh-ssh-primary"
+            onClick={submit}
+            disabled={canSend === false}
+            title={t('chatSend')}
+            aria-label={t('chatSend')}
+            style={primaryButtonStyle}
+          >
+            <SendGlyph />
+          </button>
+        )}
       </div>
       {pending === true ? (
         <div style={{ padding: '0 4px 2px', fontSize: '10px', lineHeight: '14px', color: 'var(--dsw-alias-label-quaternary)' }}>

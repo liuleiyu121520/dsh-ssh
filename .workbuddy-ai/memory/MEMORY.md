@@ -12,6 +12,10 @@
 - macOS 是 BSD grep：`\|` 不是 alternation，要用 `grep -E`。
 - 仓库 2026-10-24 才 `git init`，8b39f7b 是 root commit，无"修复前"历史。
 
+## 配置与补丁（2026-10-25 踩坑）
+- **cordis patch 的 `config` 是整块替换，不是深合并**：`vendor/include/src/index.ts` 的 `applyEntryPatches` 就是 `target[key] = value`。所以 profile 层写一条 `- id: dsh-ssh-terminal / config: {enabled: true}` 会把 bundle `cordis.patch.yml` 里的整段 config 抹掉（autoOpenFirst / 播种主机 / chat 段全没了）。→ 代码里的默认值必须落在**安全侧**（开关要 `=== true` 才开），不能指望 patch 文件兜底。
+- 同理：想给某插件加配置，优先改 bundle 自己的 patch 或写**完整** config，别只写一个字段。
+
 ## 对话助手（llm 服务）要点
 - 调模型：`ctx.get('llm')` → `listProviders()/listModels(p)/prepareCall({provider,model}).stream({provider,model,messages,system,tools,signal})`；stream 只能分发一次，每轮重新 prepareCall；options 的 provider/model 必须与 config 一致（callConfigEquals）。
 - 消息块运行时形状：text `{type:'text',text}`；assistant 工具调用 `{type:'tool-call',id,name,arguments}`；工具结果 `{role:'tool',toolCallId,content,isError}`；**assistant 必须带 `source:{kind:'model',provider,model}`**（runtime forAdapter 读 source.replayState）。

@@ -13,6 +13,7 @@
  */
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { dropChat, loadAllChats, saveChat } from './chatStore.js';
 import { t } from './locales.js';
 
 /** 接口前缀。 */
@@ -36,6 +37,31 @@ const POLL_INTERVAL_MS = 2000;
 
 /** sid -> 传输事件的 EventSource（幂等订阅，unwatchTransfer 时关）。 */
 const transferSources = new Map();
+
+/**
+ * sessionStorage 句柄。
+ *
+ * 访问本身就可能抛（隐私模式 / 存储被禁用），所以统一在这里兜住：拿不到
+ * 就返回 null，持久化全部降级成无操作——恢复对话是锦上添花，不能因为它
+ * 让右栏直接崩掉。
+ * @returns {Storage|null} 存储句柄或 null。
+ */
+function chatStorage() {
+  try {
+    return globalThis.sessionStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 流式期间落盘的节流间隔（毫秒）。
+ *
+ * 每个文字增量都写一次 sessionStorage 会把主线程拖死（一回合几百次
+ * 序列化 + 同步写）。400ms 一次足够：最坏情况丢 0.4 秒的增量，而回合结束
+ * 时是**立即**落盘的，所以正常的对话一条都不会缺。
+ */
+const CHAT_PERSIST_DELAY_MS = 400;
 
 /** @type {object} 全局状态；每次变更整体替换，保证 useSyncExternalStore 快照稳定。 */
 let state = {
@@ -68,9 +94,14 @@ let state = {
    * messages 是视图模型：user 消息 `{role, content}`，assistant 回合
    * `{role:'assistant', kind:'turn', text, calls:[...]}`（calls 即命令卡）。
    * 模块级存活，切标签不丢（与 runtimes 同一保活哲学）。
+   *
+   * 另外从 sessionStorage 恢复一次：Host 半是无状态回合，历史只活在客户端，
+   * 模块重新求值（插件热更新 / 页面刷新）时这段内存会归零，对话就整段消失。
+   * 终端不会——它的字节流在 Host 的滚动缓冲里，重挂载会自动回放。
+   * 恢复逻辑（封口、补 tool 结果、重推 pending）见 chatStore.js。
    * @type {Record<string, object>}
    */
-  chats: {},
+  chats: loadAllChats(chatStorage(), { interruptedResult: t('chatInterruptedResult') }),
   /**
    * 模型服务状态：`{status: 'idle'|'ready'|'unavailable', providers: object[], picked: {provider, model}}`。
    * @type {object}
@@ -435,6 +466,66 @@ function chatOf(sid) {
 function patchChat(sid, patch) {
   const next = { ...chatOf(sid), ...patch };
   setState({ chats: { ...state.chats, [sid]: next } });
+  // 只有消息变了才需要落盘；`streaming` 收尾（false）时立即 flush——
+  // 那一帧往往就是用户按"停止"或回合结束，丢掉最后一次写入最扎眼。
+  if (patch.messages !== undefined || patch.streaming === false) {
+    schedulePersistChat(sid, patch.streaming === false);
+  }
+}
+
+/** 待落盘的 sid 集合（同一帧里多次 patch 只写一次）。 */
+const persistQueue = new Set();
+/** 节流定时器句柄。 */
+let persistTimer = null;
+
+/**
+ * 把某个会话的历史写进 sessionStorage（节流）。
+ * @param {string} sid 会话 id。
+ * @param {boolean} [immediate] true = 跳过节流立刻写。
+ * @returns {void}
+ */
+function schedulePersistChat(sid, immediate = false) {
+  persistQueue.add(sid);
+  if (immediate === true) {
+    flushPersistChat();
+    return;
+  }
+  if (persistTimer !== null) return;
+  persistTimer = setTimeout(flushPersistChat, CHAT_PERSIST_DELAY_MS);
+}
+
+/**
+ * 立刻把队列里的会话写盘。
+ * @returns {void}
+ */
+function flushPersistChat() {
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  if (persistQueue.size === 0) return;
+  const storage = chatStorage();
+  for (const sid of persistQueue) {
+    const chat = state.chats[sid];
+    if (chat !== undefined) saveChat(storage, sid, chat.messages);
+  }
+  persistQueue.clear();
+}
+
+/**
+ * 会话彻底没了（关标签 / 删主机）：删掉内存里的对话状态与存储里的副本。
+ *
+ * sid 是每会话随机生成的，永不复用——留着只会变成存储里的孤儿。
+ * @param {string} sid 会话 id。
+ * @returns {void}
+ */
+function forgetChat(sid) {
+  persistQueue.delete(sid);
+  dropChat(chatStorage(), sid);
+  if (state.chats[sid] === undefined) return;
+  const chats = { ...state.chats };
+  delete chats[sid];
+  setState({ chats });
 }
 
 /**
@@ -1416,6 +1507,8 @@ export const actions = {
       activeSid = tabs.length === 0 ? null : tabs[Math.min(Math.max(index, 0), tabs.length - 1)];
     }
     setState({ tabs, activeSid });
+    // 会话真关了：历史留着没有归属，sid 也不会被复用。
+    forgetChat(sid);
     void actions.refreshHosts();
   },
 
@@ -1498,6 +1591,7 @@ export const actions = {
     const activeSid =
       state.activeSid !== null && sids.has(state.activeSid) ? (tabs[0] ?? null) : state.activeSid;
     setState({ tabs, activeSid });
+    for (const sid of sids) forgetChat(sid);
     await actions.refreshHosts();
     actions.showToast(t('hostDeleted'));
     return true;

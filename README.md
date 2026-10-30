@@ -124,6 +124,7 @@ src/
     HostForm.jsx    新增/编辑主机弹层（密码永不回填）
     Terminal.jsx    中栏 xterm + 保活挂载
     ChatPane.jsx    右栏对话 + 上下文卡（renderConversation 替换点）
+    chatStore.js    对话历史的 sessionStorage 持久层（热更新/刷新后恢复对话）
     store.js        模块级 store：跨卸载存活的状态 + xterm 运行时表
     locales.js      中英文案
     icons.js        24x24 currentColor 图标
@@ -139,6 +140,11 @@ src/
   按下时冻结基准宽度），几何在 `columns.js` 解算——左栏 170–420px、右栏 280–760px，中栏保底 320px；
   容器不够宽时**先让右栏、再让左栏**，且只让步不改偏好（容器恢复后自动回到用户拖的位置）。
   宽度以 CSS 变量下发 + 两侧面板 `React.memo`，拖动时每帧只重渲外框和把手。
+- **对话历史存 sessionStorage**：Host 半是无状态回合（客户端每轮 POST 完整 messages），历史只活在
+  浏览器内存里——插件热更新或页面刷新会让右栏对话整段消失，而终端不会（字节流在 Host 的滚动缓冲里）。
+  `chatStore.js` 按 sid 存一份消息（节流 400ms、回合结束立即落盘，40 条 / 160KB / 8 个会话封顶），
+  重载后恢复并把 `pending` 按"还有没有没归属的 tool-call"重推；流式中被打断的回合标 `interrupted`，
+  执行到一半的命令补一条"结果未知"的 tool 结果（否则下一轮 history 会因 tool-call 缺结果被打回）。
 - **分层挂载**：`inject = ['webServer','connection']` 是底座（终端永远可用）；
   `ctx.inject(['storageDomain','credentials'], cb)` 挂持久化半（缺则退化为 patch 只读主机）；
   `ctx.inject(['tools','systemPrompt'], cb)` 挂模型半（缺则纯手动）。缺哪个只降级哪一半。

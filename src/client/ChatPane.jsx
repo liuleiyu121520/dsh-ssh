@@ -459,6 +459,13 @@ function TurnMessage({ sid, message, showLabel = true }) {
       {calls.map((call) => (
         <CallCard key={call.id} sid={sid} call={call} />
       ))}
+      {/* 恢复出来的回合：重载时它正在流式，没人会再往里写。明说一句，比让
+          用户对着半句话猜"是不是卡了"好。 */}
+      {message.interrupted === true ? (
+        <div style={{ fontSize: '11px', lineHeight: '16px', color: 'var(--dsw-alias-label-quaternary)' }}>
+          {t('chatInterrupted')}
+        </div>
+      ) : null}
     </div>
   );
 }

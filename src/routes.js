@@ -393,6 +393,8 @@ async function handleChat(getChat, req, res) {
       approval: typeof body.approval === 'string' ? body.approval : undefined,
       provider: typeof body.provider === 'string' ? body.provider : '',
       model: typeof body.model === 'string' ? body.model : '',
+      // 定时任务要绑定一个 dsh 会话才能投递；客户端从启动台的 useSessions 里取。
+      dshSessionId: typeof body.dshSessionId === 'string' ? body.dshSessionId : '',
       signal: controller.signal,
       onEvent: (event) => safeWrite(res, formatChatFrame(event)),
     });

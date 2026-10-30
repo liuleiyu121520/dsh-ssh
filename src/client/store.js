@@ -110,6 +110,14 @@ let state = {
   /** 左栏主机列表是否收起。 */
   hostsCollapsed: false,
   /**
+   * 当前 dsh 会话 id（启动台通过 `useSessions` 给到的那个）。
+   *
+   * 只用于 `schedule_task`：dsh 的定时任务必须绑定一个会话才能投递。拿不到
+   * 就是空串，此时建任务会被宿主明确拒绝，而不是建一条投不出去的任务。
+   * @type {string}
+   */
+  dshSessionId: '',
+  /**
    * 持久化层状态（来自 GET /hosts 的 `storage` 字段）。
    * `ready=false` 时左栏显示的是 patch 只读主机，添加/编辑会被服务端拒绝；
    * `reason` 是宿主给的原因码（`already-open` / `invalid-record` / null）。
@@ -968,6 +976,8 @@ async function runChatTurn(sid, options = {}) {
         approval: state.chatApproval,
         provider: state.llm.picked.provider,
         model: state.llm.picked.model,
+        // 定时任务要绑一个 dsh 会话才能投递；由 App 从启动台的 useSessions 里取。
+        dshSessionId: state.dshSessionId ?? '',
       }),
       signal: controller.signal,
     });
@@ -1974,11 +1984,21 @@ export const actions = {
   },
 
   /**
+   * 记录当前 dsh 会话 id（启动台 `useSessions` 变化时调）。
+   * @param {string} id dsh 会话 id；拿不到就传空串。
+   * @returns {void}
+   */
+  setDshSessionId(id) {
+    const next = typeof id === 'string' ? id : '';
+    if (state.dshSessionId === next) return;
+    setState({ dshSessionId: next });
+  },
+
+  /**
    * 折叠 / 展开左栏主机列表。
    * @returns {void}
    */
-  toggleHosts() {
-    setState({ hostsCollapsed: state.hostsCollapsed !== true });
+  toggleHosts() {    setState({ hostsCollapsed: state.hostsCollapsed !== true });
   },
 
   /**

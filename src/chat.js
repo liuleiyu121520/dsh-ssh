@@ -70,6 +70,50 @@ const MAX_TAIL_CHARS = 8000;
 const MAX_HISTORY = 30;
 
 /** 聊天用的工具定义（裸 JSON Schema，与 tools.js 同一套约束）。 */
+/**
+ * 定时任务工具：把"每天早上 9 点检查磁盘"这类需求写进 **dsh 自己的调度服务**。
+ *
+ * 为什么不在插件里自己写个 cron：dsh 的 `ctx.schedule` 已经把任务持久化、
+ * 跨重启恢复、到点投递进会话都做好了，任务还会出现在 dsh 的定时任务列表里。
+ * 代价是任务绑定在一个 dsh 会话上（投递就是往那个会话发一条新消息），所以
+ * 客户端必须把"当前 dsh 会话 id"一起传上来（见 runTurn 的 dshSessionId）。
+ */
+const SCHEDULE_TOOL = Object.freeze({
+  name: 'schedule_task',
+  description:
+    '在 dsh 里创建一条定时任务：到点后 dsh 会把 prompt 当成一条新消息发给助手自动执行。'
+    + '适合"每天早上 9 点检查磁盘并汇报"这类重复任务。'
+    + 'prompt 要写成能独立看懂的一句话（未来的助手看不到现在的对话）。',
+  parameters: Object.freeze({
+    type: 'object',
+    properties: Object.freeze({
+      title: Object.freeze({ type: 'string', description: '任务标题，20 字以内' }),
+      prompt: Object.freeze({
+        type: 'string',
+        description: '到点后要执行的指令（写给未来的自己，必须独立可读）',
+      }),
+      daily_time: Object.freeze({
+        type: 'string',
+        description: '每天的执行时刻，HH:mm:ss（与 cron / every_seconds 三选一）',
+      }),
+      time_zone: Object.freeze({
+        type: 'string',
+        description: 'IANA 时区，默认 Asia/Shanghai',
+      }),
+      cron: Object.freeze({
+        type: 'string',
+        description: '五段 cron 表达式「分 时 日 月 周」，例如 0 9 * * 1-5',
+      }),
+      every_seconds: Object.freeze({
+        type: 'integer',
+        description: '固定间隔秒数（≥60）',
+      }),
+    }),
+    required: Object.freeze(['title', 'prompt']),
+    additionalProperties: false,
+  }),
+});
+
 const CHAT_TOOLS = Object.freeze([
   {
     name: 'run_command',
@@ -94,7 +138,41 @@ const CHAT_TOOLS = Object.freeze([
       additionalProperties: false,
     }),
   },
+  SCHEDULE_TOOL,
 ]);
+
+/**
+ * 把模型给的参数翻成 dsh `ScheduleCreateRequest`。
+ *
+ * 选择器（daily / cron / every）必须**恰好一个**：dsh 自己也会校验，但在
+ * 这里先挡一道，报错信息能写成人话（"你给了两个时间规则"比 invalid_selector
+ * 好懂）。
+ * @param {object} args 模型参数。
+ * @returns {{request?: object, error?: string}} 结果。
+ */
+function toScheduleRequest(args) {
+  const title = typeof args?.title === 'string' ? args.title.trim() : '';
+  const prompt = typeof args?.prompt === 'string' ? args.prompt.trim() : '';
+  if (title === '') return { error: 'title 不能为空' };
+  if (prompt === '') return { error: 'prompt 不能为空（到点后要执行什么）' };
+  const zone = typeof args?.time_zone === 'string' && args.time_zone.trim() !== ''
+    ? args.time_zone.trim()
+    : 'Asia/Shanghai';
+  const selectors = [];
+  if (typeof args?.daily_time === 'string' && args.daily_time.trim() !== '') {
+    selectors.push({ daily: { time: args.daily_time.trim(), time_zone: zone } });
+  }
+  if (typeof args?.cron === 'string' && args.cron.trim() !== '') {
+    selectors.push({ cron: { expression: args.cron.trim(), time_zone: zone } });
+  }
+  if (Number.isFinite(args?.every_seconds)) {
+    selectors.push({ every_seconds: Math.trunc(args.every_seconds) });
+  }
+  if (selectors.length !== 1) {
+    return { error: '必须且只能给一个时间规则：daily_time / cron / every_seconds' };
+  }
+  return { request: { title, prompt, ...selectors[0] } };
+}
 
 /**
  * 造一个带错误码的 Error。
@@ -249,6 +327,8 @@ function buildSystemPrompt({ session, tail, approval }) {
   const lines = [
     '你是 dsh-ssh 内置的 SSH 运维助手，运行在用户的远程终端面板旁。',
     '你可以通过 run_command 工具在用户当前的 SSH 会话里执行命令，输出会回传给你。',
+    '你也可以通过 schedule_task 工具把重复性需求做成 dsh 定时任务：到点后 dsh 会把 prompt 当新消息执行。',
+    '用户说"每天/每周/每隔一会儿帮我检查…"时，用 schedule_task，而不是 run_command 里塞 crontab。',
     '',
     '当前环境：',
     `- 主机: ${String(host.label ?? '')} (${String(host.host ?? '')}:${String(host.port ?? 22)})`,
@@ -379,7 +459,8 @@ function parseToolArgs(raw) {
   const command = typeof args.command === 'string' ? args.command.trim() : '';
   const rawTimeout = Number.parseInt(String(args.timeout_seconds ?? ''), 10);
   const seconds = Number.isInteger(rawTimeout) && rawTimeout > 0 ? Math.min(rawTimeout, MAX_TIMEOUT_MS / 1000) : DEFAULT_TIMEOUT_MS / 1000;
-  return { command, timeoutMs: seconds * 1000 };
+  // `raw` 留给别的工具（schedule_task）——它们有自己的参数表，不能只认 command。
+  return { command, timeoutMs: seconds * 1000, raw: args };
 }
 
 /**
@@ -565,6 +646,12 @@ export function createChatService(options = {}) {
    * @returns {object|undefined} deepseekAccount 服务或 undefined。
    */
   const account = typeof options.account === 'function' ? options.account : () => undefined;
+  /**
+   * 惰性取宿主的调度服务（`ctx.schedule`）。同样不进 inject：缺了只是
+   * "不能建定时任务"，run_command 照常可用。
+   * @returns {object|undefined} schedule 服务或 undefined。
+   */
+  const schedule = typeof options.schedule === 'function' ? options.schedule : () => undefined;
   const contextLines = Number.isInteger(config.maxContextLines) && config.maxContextLines > 0 ? config.maxContextLines : DEFAULT_CONTEXT_LINES;
   const defaultProvider = typeof config.provider === 'string' && config.provider !== '' ? config.provider : '';
   const defaultModel = typeof config.model === 'string' && config.model !== '' ? config.model : '';
@@ -664,6 +751,41 @@ export function createChatService(options = {}) {
   };
 
   /**
+   * 执行 `schedule_task`：写进 dsh 的调度服务。
+   *
+   * 失败一律折成 `{ok:false, content}` 回给模型，而不是抛——模型看到原因
+   * 还能换个参数重试（比如时区写错了），用户也能在卡片里看到为什么没成。
+   * @param {object} args 模型参数。
+   * @param {string} dshSessionId 当前 dsh 会话 id（任务的投递目标）。
+   * @returns {Promise<{ok: boolean, content: string, preview: string}>} 结果。
+   */
+  const runScheduleTool = async (args, dshSessionId) => {
+    const parsed = toScheduleRequest(args);
+    if (parsed.error !== undefined) return { ok: false, content: parsed.error, preview: parsed.error };
+    const scheduler = schedule();
+    if (scheduler === undefined || scheduler === null || typeof scheduler.create !== 'function') {
+      const message = '宿主没有可用的定时任务服务（schedule），这条需求建不了。';
+      return { ok: false, content: message, preview: message };
+    }
+    if (typeof dshSessionId !== 'string' || dshSessionId === '') {
+      // 任务必须绑一个 dsh 会话才能投递；客户端没把会话 id 传上来时明说，
+      // 而不是建一条永远投不出去的任务。
+      const message = '没拿到当前 dsh 会话 id，无法创建定时任务（任务要绑会话才能投递）。';
+      return { ok: false, content: message, preview: message };
+    }
+    try {
+      const record = await scheduler.create(dshSessionId, parsed.request);
+      const when = typeof record?.scheduledAt === 'string' ? record.scheduledAt : '';
+      const content = `已创建定时任务「${String(record?.title ?? parsed.request.title)}」`
+        + `${when === '' ? '' : `，下次执行：${when}`}`;
+      return { ok: true, content, preview: content };
+    } catch (error) {
+      const message = `创建失败：${String(error?.code ?? error?.message ?? error)}`;
+      return { ok: false, content: message, preview: message };
+    }
+  };
+
+  /**
    * 跑一个"用户回合"：模型轮循环，事件经 onEvent 流式吐出。
    *
    * 结束条件：模型给出纯文本收尾（finish{reason:'stop'}）；或 autoExecute=false
@@ -679,7 +801,7 @@ export function createChatService(options = {}) {
    * @param {(event: object) => void} params.onEvent 事件回调。
    * @returns {Promise<void>} 完成即 resolve（错误也以事件形式发出，不抛）。
    */
-  const runTurn = async ({ sid, messages, autoExecute, approval: approvalInput, provider, model, signal, onEvent }) => {
+  const runTurn = async ({ sid, messages, autoExecute, approval: approvalInput, provider, model, signal, onEvent, dshSessionId }) => {
     // 授权三档：auto（直接跑）/ danger（危险命令才确认）/ always（每条都确认）。
     // 老客户端只发 autoExecute 布尔值，按 true→auto、false→always 兼容。
     const approval = APPROVALS.includes(approvalInput)
@@ -871,6 +993,19 @@ export function createChatService(options = {}) {
         let paused = false;
         for (const call of result.toolCalls) {
           const args = parseToolArgs(call.arguments);
+          // 定时任务不是 shell 命令：不需要确认，直接写进 dsh 的调度服务，
+          // 卡片上把"任务标题 + 时间"当 command 显示（复用同一套卡片 UI）。
+          if (call.name === 'schedule_task') {
+            const scheduleArgs = args.raw ?? {};
+            const summary = typeof scheduleArgs.title === 'string' && scheduleArgs.title.trim() !== ''
+              ? `定时任务 · ${scheduleArgs.title.trim()}`
+              : 'schedule_task';
+            emit({ type: 'tool-call', id: call.id, name: call.name, command: summary, arguments: call.arguments });
+            const outcome = await runScheduleTool(scheduleArgs, dshSessionId);
+            history.push({ role: 'tool', toolCallId: call.id, content: outcome.content, isError: !outcome.ok });
+            emit({ type: 'tool-result', id: call.id, ok: outcome.ok, output: outcome.preview, content: outcome.content });
+            continue;
+          }
           if (call.name !== 'run_command' || args.command === '') {
             const message = call.name !== 'run_command'
               ? `unknown tool: ${call.name}`

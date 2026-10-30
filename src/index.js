@@ -326,6 +326,8 @@ export async function apply(ctx, config = {}) {
       // 惰性解析 DeepSeek 账号服务（读登录态，给未登录通道打标记）。
       // 不声明进 inject——可选服务缺失不能让对话半层 pending（铁律）。
       account: () => ctx.get('deepseekAccount'),
+      // 定时任务服务（dsh 自己的调度）：缺了只是不能建定时任务。
+      schedule: () => ctx.get('schedule'),
     });
     logger(`chat half mounted${llm === undefined || llm === null ? ' (llm missing, degraded)' : ''}`);
     return () => {

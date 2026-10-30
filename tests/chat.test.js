@@ -842,3 +842,111 @@ test('runTurn echoes replayState and a reasoning block into the next request', a
   assert.equal(assistant.content[0].type, 'reasoning', '思考块必须排第一位');
   assert.deepEqual(assistant.source.replayState, replayState, '签名要原样回传');
 });
+
+// ── schedule_task：把重复需求写进 dsh 自己的调度 ──────────────────────
+
+/** 模型要求建一条每天 9 点的定时任务。 */
+function* scheduleRound(argsJson) {
+  yield { type: 'text-delta', index: 0, text: '给你建个每天的检查任务。' };
+  yield {
+    type: 'tool-call-delta',
+    index: 1,
+    id: 'call-s1',
+    name: 'schedule_task',
+    argumentsDelta: argsJson,
+  };
+  yield {
+    type: 'block-end',
+    index: 1,
+    block: { type: 'tool-call', id: 'call-s1', name: 'schedule_task', arguments: argsJson },
+  };
+  yield { type: 'finish', reason: { kind: 'tool-calls' } };
+}
+
+/** 假 schedule 服务：只记录调用，返回一条 record。 */
+function makeFakeSchedule() {
+  /** @type {object[]} */
+  const calls = [];
+  return {
+    calls,
+    async create(sessionId, request) {
+      calls.push({ sessionId, request });
+      return { id: 'schedule-1', title: request.title, scheduledAt: '2026-10-31T01:00:00.000Z' };
+    },
+  };
+}
+
+test('schedule_task 把任务写进 dsh 调度，并带上当前会话 id', async () => {
+  const { service } = makeShellService(shellWith(''));
+  service.open({ host: LOCAL_HOST });
+  const schedule = makeFakeSchedule();
+  const args = '{"title":"磁盘日报","prompt":"检查 / 的磁盘占用并汇报","daily_time":"09:00:00"}';
+  const llm = makeFakeLlm([() => scheduleRound(args), textRound]);
+  const chat = createChatService({ service, llm, schedule: () => schedule });
+  /** @type {object[]} */
+  const events = [];
+  await chat.runTurn({
+    sid: 's1',
+    messages: [{ role: 'user', content: '每天早上 9 点帮我看看磁盘' }],
+    approval: 'danger',
+    dshSessionId: 'sess-42',
+    onEvent: (event) => events.push(event),
+  });
+
+  // 任务必须绑在客户端给的 dsh 会话上，否则到点投不出去。
+  assert.equal(schedule.calls.length, 1);
+  assert.equal(schedule.calls[0].sessionId, 'sess-42');
+  assert.deepEqual(schedule.calls[0].request, {
+    title: '磁盘日报',
+    prompt: '检查 / 的磁盘占用并汇报',
+    daily: { time: '09:00:00', time_zone: 'Asia/Shanghai' },
+  });
+
+  // 卡片：命令位显示"定时任务 · 标题"，结果位显示已创建 + 下次执行时间。
+  const card = events.find((event) => event.type === 'tool-call');
+  assert.equal(card.command, '定时任务 · 磁盘日报');
+  const result = events.find((event) => event.type === 'tool-result');
+  assert.equal(result.ok, true);
+  assert.match(result.content, /已创建定时任务「磁盘日报」/);
+  assert.match(result.content, /2026-10-31T01:00:00/);
+});
+
+test('schedule_task 缺服务 / 缺会话 / 时间规则不唯一时都回错误结果，不抛', async () => {
+  const { service } = makeShellService(shellWith(''));
+  service.open({ host: LOCAL_HOST });
+  const args = '{"title":"t","prompt":"p","daily_time":"09:00:00"}';
+
+  /** 跑一轮，返回 tool-result。 */
+  const runOnce = async (options, dshSessionId = 'sess-42') => {
+    const llm = makeFakeLlm([() => scheduleRound(options.args ?? args), textRound]);
+    const chat = createChatService({ service, llm, ...options.service });
+    /** @type {object[]} */
+    const events = [];
+    await chat.runTurn({
+      sid: 's1',
+      messages: [{ role: 'user', content: '建个定时任务' }],
+      approval: 'danger',
+      dshSessionId,
+      onEvent: (event) => events.push(event),
+    });
+    return events.find((event) => event.type === 'tool-result');
+  };
+
+  // 宿主没有 schedule 服务。
+  const noService = await runOnce({ service: {} });
+  assert.equal(noService.ok, false);
+  assert.match(noService.content, /没有可用的定时任务服务/);
+
+  // 客户端没传 dsh 会话 id。
+  const noSession = await runOnce({ service: { schedule: () => makeFakeSchedule() } }, '');
+  assert.equal(noSession.ok, false);
+  assert.match(noSession.content, /会话 id/);
+
+  // 同时给了两个时间规则：拒绝，并说清原因。
+  const twoRules = await runOnce({
+    service: { schedule: () => makeFakeSchedule() },
+    args: '{"title":"t","prompt":"p","daily_time":"09:00:00","cron":"0 9 * * *"}',
+  });
+  assert.equal(twoRules.ok, false);
+  assert.match(twoRules.content, /只能给一个时间规则/);
+});

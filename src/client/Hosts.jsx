@@ -7,8 +7,10 @@
  * - 「删除」→ 行内二次确认 → `onDelete(host)` → store.deleteHost，后者保证
  *   先 `POST /close` 关掉该主机的全部会话、再 `DELETE /hosts/<id>`。
  *
- * 行内操作常驻占位（opacity 切换而非条件渲染）：否则 hover 时主标题区宽度
- * 变化，长主机名会跳一下。
+ * 行内操作不占常驻宽度（2026-10-30 用户要求）：默认整行文字铺到最右，
+ * 只有 hover/二次确认时才在右侧让出操作区。做法是操作区绝对定位悬浮在行
+ * 右端（不参与布局），同时给主标题区加 padding-right 过渡——默认宽度全给
+ * 文字，"120.53.14.173:22 · 已断开" 这类副标题不再被提前截断。
  */
 import React, { useState } from 'react';
 import { PlusIcon } from './icons.js';
@@ -80,6 +82,14 @@ const actionButtonStyle = {
 };
 
 /**
+ * hover 时右侧要让出的宽度（px）：3 个 20px 图标 + 2 个 1px 间隙 + 6px 右边距。
+ *
+ * 与操作区的实际占位保持同一个数——两边不一致时，要么文字被按钮压住，
+ * 要么让出来的空白比按钮还宽，副标题会白丢一段可显示宽度。
+ */
+const ACTION_SLOT = 70;
+
+/**
  * 一行主机（含 hover 操作与删除二次确认）。
  *
  * 交互（2026-10-24 用户要求）：单击只选中高亮（已有会话则聚焦其标签），
@@ -112,7 +122,7 @@ function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onN
             : 'transparent',
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+      <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
         <button
           type="button"
           onClick={() => onSelect(host)}
@@ -124,7 +134,13 @@ function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onN
             display: 'flex',
             alignItems: 'center',
             gap: '8px',
-            padding: '8px 4px 8px 10px',
+            paddingTop: '8px',
+            paddingBottom: '8px',
+            paddingLeft: '10px',
+            // 默认只留 4px：整行宽度都给文字，副标题能完整显示。
+            // hover 时让出 ACTION_SLOT 给右侧操作区，过渡避免文字硬跳。
+            paddingRight: showActions ? `${ACTION_SLOT}px` : '4px',
+            transition: 'padding-right 120ms ease',
             border: 0,
             borderRadius: '8px',
             cursor: 'pointer',
@@ -155,13 +171,18 @@ function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onN
         </button>
         <div
           style={{
+            // 绝对定位：不占布局宽度，默认状态下文字能一直铺到行右端。
+            position: 'absolute',
+            top: 0,
+            right: 0,
+            bottom: 0,
             display: 'flex',
             alignItems: 'center',
             gap: '1px',
-            flex: '0 0 auto',
             paddingRight: '6px',
             opacity: showActions ? 1 : 0,
             pointerEvents: showActions ? 'auto' : 'none',
+            transition: 'opacity 120ms ease',
           }}
         >
           <button

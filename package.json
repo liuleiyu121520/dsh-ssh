@@ -1,6 +1,6 @@
 {
   "name": "dsh-ssh-terminal",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "在 DeepSeek Harness 启动台里开一个 SSH 远程终端：xterm 面板 + 有界滚动缓冲 + SSE 字节流",
   "keywords": [

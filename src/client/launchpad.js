@@ -15,9 +15,49 @@
  */
 import { SshAppView } from './App.jsx';
 import { SshIcon } from './icons.js';
+import { actions } from './store.js';
 import { messages, t } from './locales.js';
 
 export const inject = ['launchpad'];
+
+/**
+ * 把"当前 dsh 会话 id"桥接进自己的 store。
+ *
+ * 为什么需要：右栏的 `schedule_task` 要调宿主 `ctx.schedule.create(sessionId, …)`，
+ * 而 dsh 的定时任务**必须绑定一个会话**才能投递。启动台的 view props（协议 §5）
+ * 只有 `{appId, app, close, onTeardown, open, t, active}`，**拿不到会话上下文**
+ * （那是 `launchpad.panel` 槽位面板的待遇，不是标签页视图的）。
+ *
+ * 所以走客户端根上下文里的 `sessions` 服务（`@deepseek-ai/dsh-api-session-controller`
+ * 的 client 半：`rootCtx.reflect.provide('sessions', this)`）。判据与 dsh 自己的
+ * `DocumentTitle` 完全一致：`retainedBy.mainView > 0` 的那条就是当前会话；
+ * 都没有（例如刚启动还没打开会话）就退到最近更新的一条。
+ *
+ * 全程降级：服务不存在 / 形状变了 / 抛错，都只是"拿不到 id"，`schedule_task`
+ * 会明确报"没拿到当前 dsh 会话 id"，其它功能一概不受影响。
+ * @param {object} ctx 客户端 cordis 上下文。
+ * @returns {void}
+ */
+function bridgeDshSession(ctx) {
+  const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined;
+  if (sessions === undefined || sessions === null || sessions.list === undefined) return;
+  const publish = () => {
+    try {
+      const snapshot = typeof sessions.list.getSnapshot === 'function' ? sessions.list.getSnapshot() : null;
+      const rows = Object.values(snapshot?.byId ?? {});
+      const current = rows.find((row) => (row?.retainedBy?.mainView ?? 0) > 0)
+        ?? rows.slice().sort((left, right) => (right?.updatedAt ?? 0) - (left?.updatedAt ?? 0))[0];
+      actions.setDshSessionId(typeof current?.id === 'string' ? current.id : '');
+    } catch {
+      // 形状变了（dsh 大版本升级）：当作拿不到，不往上抛。
+    }
+  };
+  ctx.effect(() => {
+    publish();
+    if (typeof sessions.list.subscribe !== 'function') return undefined;
+    return sessions.list.subscribe(publish);
+  }, 'dsh-ssh: dsh session id bridge');
+}
 
 /**
  * 注册 SSH 应用卡片。
@@ -56,5 +96,13 @@ export function apply(ctx) {
   const locale = ctx.get('locale');
   if (locale !== undefined && typeof locale.register === 'function') {
     ctx.effect(() => locale.register('dsh-ssh', messages), 'dsh-ssh: locale registration');
+  }
+
+  // 会话 id 桥接：`sessions` 是客户端根服务，正常在 apply 时就已经在了；
+  // 用 inject 兜一手"晚到"的情况（回调没跑就等于没桥，不阻塞本插件）。
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['sessions'], () => bridgeDshSession(ctx));
+  } else {
+    bridgeDshSession(ctx);
   }
 }

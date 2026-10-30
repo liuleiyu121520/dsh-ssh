@@ -47,25 +47,8 @@ const MemoChatPane = React.memo(ChatPane);
  *   前同步调用一次，返回注销函数。老启动台不传，缺省就当没有。
  * @returns {JSX.Element} 三栏布局。
  */
-export function SshAppView({ active = true, onTeardown, useSessions } = {}) {
+export function SshAppView({ active = true, onTeardown } = {}) {
   const state = useSyncExternalStore(subscribe, getState);
-  /**
-   * 当前 dsh 会话 id（启动台标准 kit 的 `useSessions`）。
-   *
-   * 只给 `schedule_task` 用：dsh 的定时任务必须绑一个会话才能投递。老启动台
-   * 不传这个 share 时不调用它（hook 顺序在同一个挂载期内是稳定的），拿到
-   * 空串，宿主会明确拒绝建任务而不是建一条投不出去的任务。
-   */
-  const dshSessionId = typeof useSessions === 'function'
-    ? useSessions((sessions) => {
-        const current = Object.values(sessions?.byId ?? {})
-          .find((session) => (session?.retainedBy?.mainView ?? 0) > 0);
-        return typeof current?.id === 'string' ? current.id : '';
-      })
-    : '';
-  useEffect(() => {
-    actions.setDshSessionId(dshSessionId);
-  }, [dshSessionId]);
   const frameRef = useRef(null);
   /**
    * 容器自身宽度（不是 window.innerWidth）：应用活在启动台面板里，面板

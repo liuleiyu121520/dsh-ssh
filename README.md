@@ -167,3 +167,19 @@ src/
 - 凭据没有轮换提醒：DEK 一旦损坏（长度不对）会报 `vault-unavailable` 而不是静默覆盖（避免毁掉既有密文），
   需要人工 `unset` 那个 ref 后重新录入口令。
 - rz/sz（ZMODEM）未做，大文件走 `ssh_upload/download`。
+
+## 更新记录
+
+### v0.3.0（2026-10-30）
+
+- **三栏可拖拽调整宽度**：两条边界各一条 8px 命中条（pointer capture + rAF 节流 + 拖拽基准冻结）；
+  左 170–420、右 280–760、中栏保底 320，容器变窄时先让右栏再让左栏，只让步不改偏好。
+- **对话历史可恢复**：右栏消息落 `sessionStorage`（40 条 / 160KB / 8 会话封顶，节流 400ms + 回合结束立即落盘），
+  插件热更新或页面刷新后对话还在；流式中被打断的回合标 `interrupted`，执行到一半的命令补一条"结果未知"的 tool 结果。
+- **修输入框永久锁死**：一个批次里"自动执行 + 需确认"混合时，自动执行那条没写 `resultContent`，
+  导致 pending 永远为真。pending 判据改成看卡片状态（`awaiting`），Host 的 `tool-result` 增加 `content`（进 history 的全文）。
+- **修存储不可用**：`HostStore` 从不 `close()` 域句柄，热更新几次之后 `dsh_ssh` 域报 `already-open`，
+  左栏退回 patch 只读主机。现在 close 句柄、`GET /hosts` 返回 `storage:{ready, reason}`、左栏底部常驻原因提示。
+- **新增 `schedule_task` 工具**：右栏助手可以把"每天早上 9 点检查证书"这类需求写进 dsh 自己的调度
+  （`ctx.schedule.create`），任务出现在 dsh 的定时任务列表里。会话 id 由客户端从根服务 `sessions`
+  取当前会话（`retainedBy.mainView > 0`）后随 `POST /chat` 的 `dshSessionId` 传入；拿不到时明确报错，不建孤儿任务。

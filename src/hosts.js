@@ -111,6 +111,31 @@ export class HostStore {
     return this;
   }
 
+  /**
+   * 关掉域句柄（插件 dispose / 热更新时调）。
+   *
+   * **不关就是一个越用越坏的坑**：`DomainFacility` 按域名字登记句柄，句柄
+   * 不释放，下一次 `open('dsh_ssh')` 直接 `already-open` 失败——而插件热更新
+   * （改代码后宿主重挂插件）每次都会新建一个 HostStore。表现是热更新几次之后
+   * 左栏退回"patch 只读主机"，添加主机报"存储不可用"，只有重启应用才恢复
+   * （2026-10-30 真机）。
+   * @returns {void}
+   */
+  close() {
+    const domain = this.domain;
+    this.domain = null;
+    this.hostsTable = null;
+    this.secretsTable = null;
+    if (domain === null || domain === undefined || typeof domain.close !== 'function') return;
+    try {
+      const result = domain.close();
+      // close 可能是异步的：失败也不该往上抛（插件正在卸载）。
+      if (result !== null && typeof result === 'object' && typeof result.catch === 'function') result.catch(() => {});
+    } catch {
+      // 已经关了/已被设施回收：忽略。
+    }
+  }
+
   /** 域是否已打开。 */
   get ready() {
     return this.domain !== null && this.hostsTable !== null && this.secretsTable !== null;

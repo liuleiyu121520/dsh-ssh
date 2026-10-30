@@ -98,7 +98,20 @@ export async function apply(ctx, config = {}) {
   const logger = createLogger(ctx);
 
   /** 晚到的依赖容器：routes 拿到的是取值函数，所以 store 后到也没问题。 */
-  const state = { store: null, vault: null, chat: null };
+  const state = {
+    store: null,
+    vault: null,
+    chat: null,
+    /**
+     * 持久化层没挂上的原因（`already-open` / `invalid-record` / 服务缺失…）。
+     *
+     * 只给诊断用：客户端把这句话显示在"存储不可用"的提示里。没有它，用户
+     * 只能看到一个笼统的 501，分不清是"这个版本没有持久化"还是"域被上一次
+     * 热更新占着没放"（后者重启应用就好）。
+     * @type {string|null}
+     */
+    storageError: null,
+  };
 
   /**
    * 对话配置（patch config 的 `chat` 段）。
@@ -120,6 +133,7 @@ export async function apply(ctx, config = {}) {
   registerRoutes(ctx, {
     service,
     store: () => state.store,
+    storageError: () => state.storageError,
     chat: () => state.chat,
     transfer,
     fallbackHosts: buildFallbackHosts(config),
@@ -202,6 +216,7 @@ export async function apply(ctx, config = {}) {
       store = new HostStore({ storageDomain, vault, logger });
     } catch (error) {
       logger(`persistence unavailable: ${error.code ?? error.name}`);
+      state.storageError = String(error.code ?? error.name ?? 'unavailable');
       return () => {};
     }
     state.vault = vault;
@@ -217,11 +232,27 @@ export async function apply(ctx, config = {}) {
         .catch((error) => {
           // 域打不开：路由退回 patch 只读主机（store.ready 仍是 false）。
           state.store = null;
+          // 把原因留给客户端：`already-open` = 上一次热更新的句柄还没释放，
+          // 重启应用即可；`invalid-record` = 存量数据不合法，要修文件。
+          state.storageError = String(error.code ?? error.name ?? 'unknown');
           logger(`persistence init failed: ${error.code ?? error.name}`);
+          // 半开状态也要还回去，否则下一次 open 必然 already-open。
+          try {
+            store.close();
+          } catch {
+            // 忽略。
+          }
         }),
     );
     return () => {
-      // 插件停用：丢掉进程内缓存的 DEK（密文本身留在域里）。
+      // 插件停用：先把域句柄还回去，再丢进程内缓存的 DEK。
+      // 顺序不能反——`close()` 可能还要落一次写（密文本身留在域里）。
+      try {
+        store?.close();
+      } catch {
+        // 关闭失败不该阻断卸载。
+      }
+      state.store = null;
       try {
         vault.forget();
       } catch {

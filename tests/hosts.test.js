@@ -175,8 +175,11 @@ test('the ciphertext is bound to its hostId: swapping rows makes decryption fail
   const boxOfFirst = storageDomain.snapshot().dsh_ssh.secrets[first.id];
 
   // 模拟攻击者改库：把 A 的密文挂到 B 上（id 由服务端生成，改库是唯一路径）。
-  await storageDomain.open({ name: 'dsh_ssh', version: 1, tables: {} });
-  const secrets = (await storageDomain.open({ name: 'dsh_ssh', version: 1, tables: {} })).table('secrets');
+  //
+  // 走 store 自己的域句柄写，而不是再 open 一次：真 DomainFacility 对同名域
+  // 第二次 open 会抛 `already-open`（替身现在也照这个来），"改库"本来就是
+  // 绕过 API 直接动行，用同一个句柄写等价。
+  const secrets = store.domain.table('secrets');
   await secrets.put(second.id, boxOfFirst);
 
   await assert.rejects(() => store.getAuth(second.id), (error) => error.code === 'decrypt-failed');
@@ -296,4 +299,43 @@ test('a restart re-opens the domain and every stored host survives with its secr
   assert.equal(hosts[0].hasSecret, true);
   assert.deepEqual(await store.getAuth(record.id), { kind: 'pass', password: SECRET },
     'the ciphertext must still decrypt with the same DEK after a restart');
+});
+
+/**
+ * 插件热更新会把 `apply()` 再跑一遍（新建一个 HostStore）。
+ *
+ * 域句柄不还回去，第二次 `open('dsh_ssh')` 就被设施判成 `already-open`，
+ * 插件退化成"patch 只读主机"、添加主机报存储不可用，只有重启应用能恢复
+ * （2026-10-30 真机）。所以 close() 必须是真释放，而不是空操作。
+ */
+test('close() releases the domain so a hot-reloaded plugin can open it again', async () => {
+  const storageDomain = createFakeStorageDomain();
+  const credentials = createFakeCredentials();
+  const vault = createVault({ credentials });
+  const first = await new HostStore({ storageDomain, vault }).init();
+  const record = await first.create(HOST_INPUT);
+
+  first.close();
+  assert.equal(first.ready, false, 'close() 之后句柄必须失效');
+
+  // 热更新：同一份介质、同一个 storageDomain，新的 store 重新 open。
+  const second = await new HostStore({ storageDomain, vault }).init();
+  const hosts = await second.list();
+  assert.equal(hosts.length, 1);
+  assert.equal(hosts[0].id, record.id);
+  assert.deepEqual(await second.getAuth(record.id), { kind: 'pass', password: SECRET });
+  second.close();
+});
+
+test('without close() a second open fails as already-open — the failure this fixes', async () => {
+  const storageDomain = createFakeStorageDomain();
+  const credentials = createFakeCredentials();
+  const vault = createVault({ credentials });
+  await new HostStore({ storageDomain, vault }).init();
+
+  // 不 close 直接再挂一次：这正是热更新泄漏句柄时的样子。
+  await assert.rejects(
+    () => new HostStore({ storageDomain, vault }).init(),
+    (error) => error.code === 'storage-unavailable' && /already-open/.test(error.message),
+  );
 });

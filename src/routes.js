@@ -429,6 +429,13 @@ export function registerRoutes(ctx, options = {}) {
    */
   const getStore = () =>
     (typeof options.store === 'function' ? options.store() : options.store ?? null);
+
+  /**
+   * 持久化层没挂上的原因（诊断用，可能是 null）。
+   * @returns {string|null} 错误码。
+   */
+  const getStorageError = () =>
+    (typeof options.storageError === 'function' ? options.storageError() : options.storageError ?? null);
   /**
    * 取当前的对话服务（llm 分层 inject 晚到；缺失时为 null）。
    * @returns {object|null} chat 服务或 null。
@@ -443,7 +450,13 @@ export function registerRoutes(ctx, options = {}) {
   const requireStore = () => {
     const store = getStore();
     if (store === null || store === undefined || store.ready !== true) {
-      throw codedError('storage-unavailable', 'host storage is not available');
+      // 带上原因：`already-open` 是热更新留下的句柄，重启即好；`invalid-record`
+      // 是存量数据坏了。笼统的 501 让用户完全没法自助（2026-10-30 真机）。
+      const reason = getStorageError();
+      throw codedError(
+        'storage-unavailable',
+        reason === null ? 'host storage is not available' : `host storage is not available (${reason})`,
+      );
     }
     return store;
   };
@@ -548,7 +561,14 @@ export function registerRoutes(ctx, options = {}) {
       const byHost = pickSessions(sessions);
       const records = await listRecords();
       const hosts = records.map((record) => toHostView(record, byHost.get(record.id) ?? null));
-      sendJson(res, 200, { hosts, sessions, activeSid: service.activeSid });
+      // `storage` 让客户端能解释"为什么加不了主机"：ready=false 时左栏显示的是
+      // patch 只读表，原因在 reason 里（可能为 null = 宿主没有持久化服务）。
+      const store = getStore();
+      const storage = {
+        ready: store !== null && store !== undefined && store.ready === true,
+        reason: getStorageError(),
+      };
+      sendJson(res, 200, { hosts, sessions, activeSid: service.activeSid, storage });
       return;
     }
     if (req.method === 'POST') {

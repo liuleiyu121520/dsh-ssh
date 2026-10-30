@@ -109,6 +109,13 @@ let state = {
   llm: { status: 'idle', providers: [], picked: { provider: '', model: '' } },
   /** 左栏主机列表是否收起。 */
   hostsCollapsed: false,
+  /**
+   * 持久化层状态（来自 GET /hosts 的 `storage` 字段）。
+   * `ready=false` 时左栏显示的是 patch 只读主机，添加/编辑会被服务端拒绝；
+   * `reason` 是宿主给的原因码（`already-open` / `invalid-record` / null）。
+   * @type {{ready: boolean, reason: string|null}}
+   */
+  storage: { ready: true, reason: null },
   /** 左栏当前高亮的主机 id（单击只选中，双击才连接）。 */
   selectedHostId: null,
   /**
@@ -246,12 +253,43 @@ const ERROR_KEYS = {
 };
 
 /**
+ * 上一次已经提示过的存储不可用文案。
+ *
+ * 轮询每 2s 一次，不加这个守卫的话提示会一直重弹（用户根本没法看）。
+ * 只在"原因变了"时再弹一次——比如从"没有持久化服务"变成"already-open"。
+ * @type {string|null}
+ */
+let lastStorageNotice = null;
+
+/**
+ * 记录持久化层的可用状态，并在不可用时提示一次（带原因码）。
+ * @param {{ready?: boolean, reason?: string|null}|undefined} storage GET /hosts 的 `storage` 字段。
+ * @returns {void}
+ */
+function noteStorage(storage) {
+  if (storage === null || typeof storage !== 'object') return;
+  const ready = storage.ready === true;
+  const reason = typeof storage.reason === 'string' && storage.reason !== '' ? storage.reason : null;
+  const previous = state.storage ?? { ready: true, reason: null };
+  if (previous.ready !== ready || previous.reason !== reason) setState({ storage: { ready, reason } });
+  if (ready === true) {
+    lastStorageNotice = null;
+    return;
+  }
+  // 原因码进提示：`already-open`（热更新留下的句柄，重启即好）和
+  // `invalid-record`（存量数据坏了）要采取的动作完全不同。
+  const notice = reason === null ? t('errorStorageUnavailable') : `${t('errorStorageUnavailable')}（${reason}）`;
+  if (notice === lastStorageNotice) return;
+  lastStorageNotice = notice;
+  actions.showToast(notice);
+}
+
+/**
  * 把异常翻成一句人话（优先按错误码查表）。
  * @param {unknown} error 异常。
  * @returns {string} 文案。
  */
-function describeError(error) {
-  const code = error !== null && typeof error === 'object' ? error.code : null;
+function describeError(error) {  const code = error !== null && typeof error === 'object' ? error.code : null;
   const key = typeof code === 'string' ? ERROR_KEYS[code] : undefined;
   if (key !== undefined) return t(key);
   const message = error instanceof Error ? error.message : String(error);
@@ -1253,6 +1291,7 @@ export const actions = {
       let activeSid = state.activeSid;
       if (activeSid === null || !known.has(activeSid)) activeSid = tabs[0] ?? null;
       setState({ hosts, sessions, tabs, activeSid });
+      noteStorage(payload.storage);
     } catch {
       // 首刷失败：保留空表，左栏显示"加载中…"，下一轮轮询会纠正。
     }
@@ -1271,6 +1310,7 @@ export const actions = {
       const payload = await actions._get('/hosts');
       const sessions = indexSessions(payload.sessions);
       setState({ hosts: payload.hosts ?? state.hosts, sessions });
+      noteStorage(payload.storage);
     } catch {
       // 轮询失败保留上一次数据；下一轮轮询会纠正。
     }

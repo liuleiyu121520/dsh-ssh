@@ -40,6 +40,15 @@ const NAME_PATTERN = /^[a-z][a-z0-9_]*$/;
 export function createFakeStorageDomain(options = {}) {
   /** @type {Map<string, {spec: object, tables: Map<string, Map<string, unknown>>}>} */
   const domains = new Map();
+  /**
+   * 当前处于 open 状态的域名。
+   *
+   * 真 `DomainFacility` 按名字登记句柄，重复 open 直接抛 `already-open`。
+   * 替身必须复现这条，否则"插件热更新后没还句柄 → 存储不可用"这个真机
+   * bug（2026-10-30）在单测里永远测不出来。
+   * @type {Set<string>}
+   */
+  const openNames = new Set();
   /** @type {object} 介质上的存量数据（`open()` 时灌进新建的域）。 */
   const medium = options.restore ?? {};
 
@@ -217,6 +226,10 @@ export function createFakeStorageDomain(options = {}) {
       if (typeof name !== 'string' || !NAME_PATTERN.test(name)) {
         throw new Error(`fake-storage-domain: illegal domain name ${JSON.stringify(name)}`);
       }
+      if (openNames.has(name)) {
+        throw new Error(`fake-storage-domain: already-open — domain '${name}' is already open; close it first`);
+      }
+      openNames.add(name);
       let entry = domains.get(name);
       if (entry === undefined) {
         /** @type {Map<string, Map<string, unknown>>} */
@@ -267,8 +280,10 @@ export function createFakeStorageDomain(options = {}) {
           }
           return out;
         },
-        /** 关闭域（假实现里是空操作，只为对齐契约）。 */
-        close() {},
+        /** 关闭域：释放名字，之后再 open 同一域才是合法的。 */
+        close() {
+          openNames.delete(name);
+        },
       };
     },
   };

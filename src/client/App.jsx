@@ -1,7 +1,9 @@
 /**
  * 应用视图：三栏骨架 + 多标签（设计 §2）。
  *
- * 左 220px 主机列表 / 中 flex:1（标签条 + 终端）/ 右 360px 可折叠上下文卡。
+ * 左栏（主机）/ 中栏 flex:1（标签条 + 终端）/ 右栏（AI 助手）。
+ * 三栏宽度可拖拽调整：两条边界各有一个 8px 命中条（见 SplitHandle.jsx），
+ * 几何解算在 columns.js（夹在 [MIN, MAX]、给中栏留 CENTER_MIN）。
  * 高度撑满父容器——启动台协议 §5 明确容器已处理高度与滚动，应用绝不写
  * height:100vh，也不加顶部避让。
  *
@@ -14,14 +16,27 @@
  *
  * 其余数据一律走模块级 store，所以本组件可以被独立渲染、独立单测。
  */
-import React, { useCallback, useEffect, useSyncExternalStore } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { actions, getState, subscribe } from './store.js';
 import { Hosts, HostsToggle } from './Hosts.jsx';
 import { Tabs } from './Tabs.jsx';
 import { Terminal } from './Terminal.jsx';
 import { ChatPane, ChatToggle } from './ChatPane.jsx';
 import { HostForm } from './HostForm.jsx';
+import { SplitHandle } from './SplitHandle.jsx';
+import { CHAT_DEFAULT, CHAT_MIN, HOSTS_DEFAULT, HOSTS_MIN, clampWidth, dragCeiling, solveColumns } from './columns.js';
 import { t } from './locales.js';
+
+/**
+ * 两栏都包一层 memo：宽度通过 CSS 变量下发（不经过 props），所以拖动时
+ * props 全等 → 这两棵子树（主机行 / 整棵对话树）一次都不重渲，每帧只重渲
+ * 外框和两个把手。消息很多时这就是"丝滑"与"掉帧"的分界。
+ *
+ * memo 不挡 store 更新：两者内部都用 useSyncExternalStore 订阅，数据变化
+ * 照常重渲。
+ */
+const MemoHosts = React.memo(Hosts);
+const MemoChatPane = React.memo(ChatPane);
 
 /**
  * SSH 应用视图。
@@ -34,6 +49,77 @@ import { t } from './locales.js';
  */
 export function SshAppView({ active = true, onTeardown } = {}) {
   const state = useSyncExternalStore(subscribe, getState);
+  const frameRef = useRef(null);
+  /**
+   * 容器自身宽度（不是 window.innerWidth）：应用活在启动台面板里，面板
+   * 可以被拖宽拖窄，甚至和窗口没关系。量不到之前是 0，solveColumns 会
+   * 先按偏好渲染，一帧后修正。
+   */
+  const [viewport, setViewport] = useState(0);
+  // 用户拖出来的宽度偏好：容器变窄只做让步（solveColumns），不改这两个值。
+  const [hostsWidth, setHostsWidth] = useState(HOSTS_DEFAULT);
+  const [chatWidth, setChatWidth] = useState(CHAT_DEFAULT);
+  // 拖拽中：整棵子树禁掉文本选中，否则横扫三栏会把主机名/IP 全选蓝。
+  const [dragging, setDragging] = useState(false);
+
+  // 量容器宽度：rAF 合并 ResizeObserver 的连发，避免一次拖动写出几十帧。
+  useLayoutEffect(() => {
+    const el = frameRef.current;
+    if (el === null) return undefined;
+    let raf = null;
+    let disposed = false;
+    const measure = () => {
+      const width = el.getBoundingClientRect().width;
+      if (width > 0) setViewport((prev) => (Math.abs(prev - width) < 0.5 ? prev : width));
+    };
+    measure();
+    const observer = new ResizeObserver(() => {
+      if (disposed) return;
+      raf ??= requestAnimationFrame(() => {
+        raf = null;
+        measure();
+      });
+    });
+    observer.observe(el);
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      if (raf !== null) cancelAnimationFrame(raf);
+    };
+  }, []);
+
+  const cols = solveColumns(viewport, hostsWidth, chatWidth);
+  // 拖拽回调注册在 pointer 事件上，闭包里不能拿渲染时的旧值：两个 ref 保持最新。
+  const colsRef = useRef(cols);
+  colsRef.current = cols;
+  const viewportRef = useRef(viewport);
+  viewportRef.current = viewport;
+  // 拖拽基准：按下那一刻的**实际**宽度（不是偏好），整个手势只加 dx。
+  const hostsBase = useRef(0);
+  const chatBase = useRef(0);
+
+  const handleDragEnd = useCallback(() => setDragging(false), []);
+
+  const handleHostsDragStart = useCallback(() => {
+    hostsBase.current = colsRef.current.hosts;
+    setDragging(true);
+  }, []);
+
+  const handleHostsDrag = useCallback((dx) => {
+    const ceiling = dragCeiling('hosts', viewportRef.current, colsRef.current);
+    setHostsWidth(clampWidth(hostsBase.current + dx, HOSTS_MIN, ceiling));
+  }, []);
+
+  const handleChatDragStart = useCallback(() => {
+    chatBase.current = colsRef.current.chat;
+    setDragging(true);
+  }, []);
+
+  const handleChatDrag = useCallback((dx) => {
+    // 右栏把手往左拖 = 变宽，所以取负。
+    const ceiling = dragCeiling('chat', viewportRef.current, colsRef.current);
+    setChatWidth(clampWidth(chatBase.current - dx, CHAT_MIN, ceiling));
+  }, []);
 
   useEffect(() => {
     // 轮询跟着 view 生命周期走：挂载刷一次 + 每 2s 更新状态灯，卸载即停。
@@ -142,6 +228,7 @@ export function SshAppView({ active = true, onTeardown } = {}) {
 
   return (
     <div
+      ref={frameRef}
       style={{
         display: 'flex',
         width: '100%',
@@ -152,12 +239,17 @@ export function SshAppView({ active = true, onTeardown } = {}) {
         font: '13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif',
         color: 'var(--dsw-alias-label-primary)',
         background: 'var(--dsw-alias-bg-base)',
+        // 两栏宽度以 CSS 变量下发：拖动时每帧只改样式，不触发两侧面板重渲。
+        '--dsh-ssh-hosts-w': `${cols.hosts}px`,
+        '--dsh-ssh-chat-w': `${cols.chat}px`,
+        // 拖动中禁选中 + 全容器保持 col-resize：指针扫过终端时不要变回文本光标。
+        ...(dragging ? { userSelect: 'none', cursor: 'col-resize' } : {}),
       }}
     >
       {state.hostsCollapsed ? (
         <HostsToggle onExpand={actions.toggleHosts} />
       ) : (
-        <Hosts
+        <MemoHosts
           hosts={state.hosts}
           activeSid={state.activeSid}
           gaps={state.gaps}
@@ -192,7 +284,30 @@ export function SshAppView({ active = true, onTeardown } = {}) {
           )}
         </div>
       </main>
-      {state.chatOpen ? <ChatPane /> : <ChatToggle />}
+      {state.chatOpen ? <MemoChatPane /> : <ChatToggle />}
+      {/**
+       * 两条拖拽边界。收起态的窄条（36px）是固定宽度，没有把手。
+       * 左边界用 left 定位、右边界用 right 定位——右栏贴容器右沿，用 right
+       * 就不依赖 viewport 测量，窗口变化时把手不会慢半帧。
+       */}
+      {state.hostsCollapsed ? null : (
+        <SplitHandle
+          side="hosts"
+          left={cols.hosts}
+          onStart={handleHostsDragStart}
+          onDrag={handleHostsDrag}
+          onEnd={handleDragEnd}
+        />
+      )}
+      {state.chatOpen ? (
+        <SplitHandle
+          side="chat"
+          right={cols.chat}
+          onStart={handleChatDragStart}
+          onDrag={handleChatDrag}
+          onEnd={handleDragEnd}
+        />
+      ) : null}
       <HostForm />
       {state.toast !== null ? (
         <div

@@ -984,6 +984,9 @@ const heroFloatStyle = { position: 'absolute', left: 0, right: 0, bottom: '100%'
 
 /**
  * 右栏面板：模型控制 + 消息列表 + 输入区。
+ *
+ * 宽度走 CSS 变量 `--dsh-ssh-chat-w`（App 写在根节点上）：拖动时每帧都变，
+ * 用 props 会让整棵对话树跟着重渲（消息多时直接掉帧），变量只改样式。
  * @returns {JSX.Element} 右栏。
  */
 export function ChatPane() {
@@ -1043,11 +1046,13 @@ export function ChatPane() {
   return (
     <aside
       style={{
-        width: '360px',
+        width: 'var(--dsh-ssh-chat-w, 360px)',
         flex: '0 0 auto',
         display: 'flex',
         flexDirection: 'column',
         minHeight: 0,
+        // 拖拽逐帧写宽度，不能有过渡，否则栏沿脱离指针。
+        transition: 'none',
         borderLeft: '0.5px solid var(--dsw-alias-border-l2)',
         background: 'var(--dsw-alias-bg-base)',
       }}

@@ -271,6 +271,10 @@ function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onN
 
 /**
  * 左栏组件。
+ *
+ * 宽度走 CSS 变量 `--dsh-ssh-hosts-w`（由 App 写在根节点上），不走 props：
+ * 拖动时每帧都在变，用 props 会让本组件（以及它下面的主机行）跟着重渲；
+ * 变量只改样式，配合 React.memo 可以让拖动期间这里一次都不重渲。
  * @param {{hosts: object[], activeSid: string|null, gaps?: object, onSelect: (host: object) => void, onAdd: () => void, onOpenTab: (hostId: string) => void, onEdit: (host: object) => void, onDelete: (host: object) => void}} props 组件参数。
  * @returns {JSX.Element} 左栏。
  */
@@ -278,11 +282,13 @@ export function Hosts({ hosts, activeSid, gaps = {}, selectedHostId = null, onSe
   return (
     <aside
       style={{
-        width: '220px',
+        width: 'var(--dsh-ssh-hosts-w, 220px)',
         flex: '0 0 auto',
         display: 'flex',
         flexDirection: 'column',
         minHeight: 0,
+        // 拖动时宽度是逐帧写进去的，任何 transition 都会让栏沿脱离指针。
+        transition: 'none',
         borderRight: '0.5px solid var(--dsw-alias-border-l2)',
         background: 'var(--dsw-alias-bg-base)',
       }}

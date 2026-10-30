@@ -116,7 +116,9 @@ src/
   client/
     entry.js        bundle 入口（再导出 launchpad 的 {inject, apply}）
     launchpad.js    启动台适配层——与 dsh-launchpad 的唯一耦合点
-    App.jsx         三栏骨架
+    App.jsx         三栏骨架 + 分栏拖拽（宽度解算走 columns.js）
+    columns.js      三栏几何：clampWidth / solveColumns / dragCeiling（纯函数，可单测）
+    SplitHandle.jsx 分栏把手：pointer capture + rAF 节流 + 拖拽基准冻结
     Hosts.jsx       左栏主机列表 + 状态灯 + 增删改
     Tabs.jsx        中栏标签条
     HostForm.jsx    新增/编辑主机弹层（密码永不回填）
@@ -133,6 +135,10 @@ src/
   客户端半打成单个 `lib/client.js`（esbuild `minify: true`，体积预算 520KB 写在 `scripts/build.mjs`
   里，超了就让构建失败），外层 `window.__ModuleLoader__.load({...})`，内层 esbuild CJS 产物跑在
   自带 module 作用域里，`react` / `react-dom` 外链（宿主 `require` 提供，不进 bundle）。
+- **三栏可拖拽调整宽度**：两条边界各一条 8px 命中条（`SplitHandle.jsx`，pointer capture + rAF 节流 +
+  按下时冻结基准宽度），几何在 `columns.js` 解算——左栏 170–420px、右栏 280–760px，中栏保底 320px；
+  容器不够宽时**先让右栏、再让左栏**，且只让步不改偏好（容器恢复后自动回到用户拖的位置）。
+  宽度以 CSS 变量下发 + 两侧面板 `React.memo`，拖动时每帧只重渲外框和把手。
 - **分层挂载**：`inject = ['webServer','connection']` 是底座（终端永远可用）；
   `ctx.inject(['storageDomain','credentials'], cb)` 挂持久化半（缺则退化为 patch 只读主机）；
   `ctx.inject(['tools','systemPrompt'], cb)` 挂模型半（缺则纯手动）。缺哪个只降级哪一半。

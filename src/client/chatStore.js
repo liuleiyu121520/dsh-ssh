@@ -143,8 +143,10 @@ export function dropChat(storage, sid) {
  *    标成 failed + 一条"结果未知"的 tool 结果——既诚实，又保证
  *    buildChatHistory 产出的 history 合法（有 tool-call 就必须有 tool 结果，
  *    否则下一轮请求会被 wire 校验打回）；
- * 3. **重推 pending**：还有没归属的 tool-call 就回到"等用户点执行"的状态，
- *    这条判据与 resolveToolCall 末尾那段完全一致。
+ * 3. **重推 pending**：还有 `awaiting` 的卡片就回到"等用户点执行"的状态。
+ *    判据是**卡片状态**而不是"有没有 tool 结果"——自动执行的命令历史上
+ *    不写 resultContent，用"缺结果"判断会让恢复出来的对话一进来就锁死
+ *    输入框（与 store.hasOpenCall 保持同一条规则）。
  * @param {object[]} messages 存下来的消息。
  * @param {{interruptedResult?: string}} [options] interruptedResult 是补进
  *   history 的那句"结果未知"文案（由调用方给，保持本模块无本地化依赖）。
@@ -177,8 +179,20 @@ export function restoreChatState(messages, options = {}) {
         });
         continue;
       }
+      // 已经落终态却没有结果的卡片（旧版本里自动执行的那批命令就是这样）：
+      // 用它的预览输出补上。不补的话，下次发消息时 history 里会有一条
+      // tool-call 没有对应的 tool 结果，请求会被 wire 校验打回。
+      if (call.resultContent === undefined && (call.status === 'done' || call.status === 'failed' || call.status === 'skipped')) {
+        calls.push({
+          ...call,
+          resultContent: typeof call.output === 'string' ? call.output : '',
+          resultError: call.status !== 'done',
+        });
+        continue;
+      }
       calls.push({ ...call });
-      if (call.resultContent === undefined) pending = true;
+      // 判据与 store.hasOpenCall 一致：看卡片状态，不看"有没有结果"。
+      if (call.status === 'awaiting') pending = true;
     }
     // 只有最后一条可能是 streaming：中间那些在 round 边界就被封口了。
     const last = index === list.length - 1;

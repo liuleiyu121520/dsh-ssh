@@ -740,11 +740,21 @@ function handleChatEvent(sid, event) {
     return;
   }
   if (event?.type === 'tool-result') {
+    // **必须写 resultContent**：自动执行的命令（不需要用户确认的那批）只
+    // 走这条分支，没有别的路径会补结果。漏了它，下一轮 POST 的 history 里
+    // 就只有 tool-call 没有 tool 结果——wire 校验会打回，而且"还有没有
+    // 没归属的命令"的判据也会永远为真（2026-10-30 真机：混合批次里用户
+    // 点完"执行"，输入框就一直锁着）。
+    const content = typeof event.content === 'string'
+      ? event.content
+      : (typeof event.output === 'string' ? event.output : '');
     patchCall(sid, event.id, {
       status: event.ok === true ? 'done' : 'failed',
       ok: event.ok === true,
       output: typeof event.output === 'string' ? event.output : '',
       timedOut: event.timedOut === true,
+      resultContent: content,
+      resultError: event.ok !== true,
     });
     return;
   }
@@ -845,14 +855,36 @@ function handleChatEvent(sid, event) {
 }
 
 /**
+ * 还有没有"等着用户处理"的命令卡。
+ *
+ * 判据是**卡片状态**，不是"有没有 resultContent"：自动执行的那批命令由
+ * Host 发 `tool-result` 事件，早先这条分支不写 resultContent，用"缺结果"
+ * 当判据会让一个混合批次（一条自动跑 + 一条要确认）在用户点完"执行"之后
+ * 永远 pending——输入框锁死、也没有卡片可点（2026-10-30 真机）。
+ * @param {object[]} messages 视图模型消息。
+ * @returns {boolean} 还有没归属的卡片返回 true。
+ */
+function hasOpenCall(messages) {
+  for (const message of messages) {
+    if (message.kind !== 'turn') continue;
+    for (const call of message.calls ?? []) {
+      if (call.status === 'awaiting') return true;
+      // 执行中的卡片也算"没归属"：exec 请求挂了的时候不能放用户去发新消息，
+      // 否则 history 里会留下没有结果的 tool-call。
+      if (call.status === 'running' && call.resultContent === undefined) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 这一轮是否"什么都没产出"（没有正文、没有命令卡）。
  *
  * 只有这种情况才适合换通道后自动重发：已经有内容时重发，模型看到的是
  * "自己说过的话"，会接着写而不是重新回答，反而更乱。
  * @param {string} sid 会话 id。
  * @returns {boolean} 没产出返回 true。
- */
-function producedNothing(sid) {
+ */function producedNothing(sid) {
   const last = chatOf(sid).messages.at(-1);
   if (last === undefined || last.kind !== 'turn') return true;
   const hasText = typeof last.text === 'string' && last.text !== '';
@@ -1881,15 +1913,16 @@ export const actions = {
     }
 
     // 全部命令都有归属后续跑，否则等用户把剩下的点完。
-    const messages = chatOf(sid).messages;
-    let pending = false;
-    for (const message of messages) {
-      if (message.kind !== 'turn') continue;
-      for (const call of message.calls ?? []) {
-        if (call.resultContent === undefined) pending = true;
-      }
+    //
+    // pending 必须显式写回：这一轮原本就是 pending=true（finish{tool-call}
+    // 打上的），只在 runChatTurn 开头才被清掉；万一那次续跑没起来（并发
+    // 守卫、通道异常），用户就会面对一个"没有任何卡片却锁着输入框"的死局。
+    if (hasOpenCall(chatOf(sid).messages) === true) {
+      patchChat(sid, { pending: true });
+      return;
     }
-    if (pending !== true) await runChatTurn(sid);
+    patchChat(sid, { pending: false });
+    await runChatTurn(sid);
   },
 
   /**

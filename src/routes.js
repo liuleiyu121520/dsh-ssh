@@ -354,6 +354,11 @@ export function formatChatFrame(event) {
  * 客户端据此把正文与命令卡分段）→ … → `finish`；
  * 出错是 `error` 帧不断流。finish.reason='tool-call' 表示人工确认模式下
  * 回合暂停，客户端执行后带 tool 结果再次 POST 续跑。
+ *
+ * `tool-result` 带两个文本字段，别混用：`output` 是给人看的预览（1200 字，
+ * 卡片里展开的那段），`content` 是**进 history 的全文**（6000 字上限）。
+ * 客户端必须把 content 存成 resultContent——它下一轮 POST 的 history 就是
+ * 靠这个字段拼 tool 结果。
  * @param {() => object|null} getChat 取对话服务（llm 缺失时为 null）。
  * @param {object} req 请求。
  * @param {object} res 响应。

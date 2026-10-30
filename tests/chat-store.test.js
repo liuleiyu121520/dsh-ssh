@@ -154,6 +154,18 @@ test('restoreChatState：中间回合永远不带 interrupted，只有最后一�
   assert.equal(state.messages[1].interrupted, true);
 });
 
+test('restoreChatState：旧历史里"已完成但没有结果"的卡片被补上结果，且不锁输入框', () => {
+  // 2026-10-30 之前存下的历史：自动执行的命令只落了 output，没有 resultContent。
+  const state = restoreChatState([
+    userMessage('看看证书'),
+    turnMessage('查一下', { calls: [callCard('c1', { resultContent: undefined, output: 'a.pem\nb.pem' })] }),
+  ], { interruptedResult: '结果未知' });
+
+  assert.equal(state.pending, false, '已经落终态的卡片不算"待处理"');
+  assert.equal(state.messages[1].calls[0].resultContent, 'a.pem\nb.pem', '用预览输出补上 tool 结果');
+  assert.equal(state.messages[1].calls[0].resultError, false);
+});
+
 test('restoreChatState：脏数据不炸（null / 缺字段 / 非数组）', () => {
   const state = restoreChatState([null, { role: 'user' }, { kind: 'turn' }, 42]);
   assert.equal(state.messages.length, 2);

@@ -876,7 +876,7 @@ export function createChatService(options = {}) {
               ? `unknown tool: ${call.name}`
               : 'run_command 缺少 command 参数';
             history.push({ role: 'tool', toolCallId: call.id, content: message, isError: true });
-            emit({ type: 'tool-result', id: call.id, ok: false, output: message });
+            emit({ type: 'tool-result', id: call.id, ok: false, output: message, content: message });
             continue;
           }
           // danger 档：只拦危险命令；always 档：每条都拦。
@@ -901,7 +901,18 @@ export function createChatService(options = {}) {
             ? `${outcome.output}\n[超时：命令未在限定时间内结束，已发送 Ctrl+C]`
             : outcome.output;
           history.push({ role: 'tool', toolCallId: call.id, content, isError: !outcome.ok });
-          emit({ type: 'tool-result', id: call.id, ok: outcome.ok, output: outcome.preview, timedOut: outcome.timedOut === true });
+          // `content` 是**进 history 的全文**（截到 6000 字），`output` 只是
+          // 给人看的预览（1200 字）。客户端要把 content 存成 resultContent：
+          // 它下一轮 POST 的 history 就是靠这个字段拼 tool 结果的，用预览
+          // 会把模型上一轮看到的东西换掉。
+          emit({
+            type: 'tool-result',
+            id: call.id,
+            ok: outcome.ok,
+            output: outcome.preview,
+            content,
+            timedOut: outcome.timedOut === true,
+          });
         }
         if (paused === true) {
           emit({

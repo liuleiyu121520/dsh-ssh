@@ -284,9 +284,13 @@ function noteStorage(storage) {
     lastStorageNotice = null;
     return;
   }
-  // 原因码进提示：`already-open`（热更新留下的句柄，重启即好）和
-  // `invalid-record`（存量数据坏了）要采取的动作完全不同。
-  const notice = reason === null ? t('errorStorageUnavailable') : `${t('errorStorageUnavailable')}（${reason}）`;
+  // 只有"确实失败了"才提示：`reason === null` 只是宿主还没把持久化层挂上
+  // （启动瞬间的第一次轮询必然撞上这个窗口），这时候弹提示是误报。
+  if (reason === null) return;
+  // 原因决定该做什么：`already-open` 重启即好，别的码要去查数据/环境。
+  const notice = reason === 'already-open'
+    ? t('errorStorageUnavailableDetail', { detail: t('storageHotReload') })
+    : t('errorStorageUnavailableDetail', { detail: t('storageBroken', { reason }) });
   if (notice === lastStorageNotice) return;
   lastStorageNotice = notice;
   actions.showToast(notice);

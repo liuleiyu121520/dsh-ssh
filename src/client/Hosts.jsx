@@ -278,7 +278,7 @@ function HostRow({ host, active, selected = false, gap, onSelect, onOpenTab, onN
  * @param {{hosts: object[], activeSid: string|null, gaps?: object, onSelect: (host: object) => void, onAdd: () => void, onOpenTab: (hostId: string) => void, onEdit: (host: object) => void, onDelete: (host: object) => void}} props 组件参数。
  * @returns {JSX.Element} 左栏。
  */
-export function Hosts({ hosts, activeSid, gaps = {}, selectedHostId = null, onSelect, onAdd, onOpenTab, onNewTab, onEdit, onDelete, onCollapse }) {
+export function Hosts({ hosts, activeSid, gaps = {}, selectedHostId = null, storage = null, onSelect, onAdd, onOpenTab, onNewTab, onEdit, onDelete, onCollapse }) {
   return (
     <aside
       style={{
@@ -352,6 +352,26 @@ export function Hosts({ hosts, activeSid, gaps = {}, selectedHostId = null, onSe
         )}
       </div>
       <div style={{ padding: '8px' }}>
+        {/* 持久化层没挂上时的常驻提示：toast 会消失，这里一直看得见。
+            原因码直接露出来——`already-open` 重启就好，别的码要去查数据。 */}
+        {storage?.ready === false && typeof storage.reason === 'string' ? (
+          <div
+            role="status"
+            style={{
+              marginBottom: '6px',
+              padding: '6px 8px',
+              borderRadius: '6px',
+              fontSize: '11px',
+              lineHeight: '16px',
+              color: 'var(--dsw-alias-label-error)',
+              background: 'var(--dsw-alias-bg-layer-2)',
+            }}
+          >
+            {storage.reason === 'already-open'
+              ? t('storageHotReload')
+              : t('storageBroken', { reason: storage.reason })}
+          </div>
+        ) : null}
         <button
           type="button"
           onClick={onAdd}

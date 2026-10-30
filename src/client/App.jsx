@@ -271,6 +271,7 @@ export function SshAppView({ active = true, onTeardown, useSessions } = {}) {
           activeSid={state.activeSid}
           gaps={state.gaps}
           selectedHostId={state.selectedHostId}
+          storage={state.storage}
           onSelect={handleSelect}
           onAdd={handleAdd}
           onOpenTab={handleOpenTab}

@@ -5,8 +5,10 @@
  * 内部模块——因此可以在 node --test 里被直接引用。
  *
  * 三条纪律：
- * 1. 每条路由第一件事都是 `ctx.connection.requestRejection(req)`（M0 铁律，
- *    设计 §7.7）：连接层（远程访问鉴权一类的全局策略）说拒就拒；
+ * 1. 每条路由第一件事都是准入守卫（`guard.js` 的 `rejectionFor`：新版宿主
+ *    `connection.admit` 优先、旧版 `requestRejection` 兜底；M0 铁律，设计
+ *    §7.7）：连接层（远程访问鉴权一类的全局策略）说拒就拒；无决策时落回
+ *    结构性来源围栏，任何路径都不抛异常；
  * 2. 响应体序列化前必过 `toHostView()`，**禁止 `...host` 展开**（设计 §7.6）；
  * 3. 错误体统一 `{error, code}`，`error` 保留给 M0 客户端做兼容。
  *
@@ -17,6 +19,7 @@
  */
 import { SessionStatus } from './sessions.js';
 import { toHostView } from './schema.js';
+import { rejectionFor } from './guard.js';
 
 /** 路由前缀。 */
 const PREFIX = '/api/dsh-ssh';
@@ -106,15 +109,29 @@ export function formatMetaFrame(meta) {
 
 /**
  * 连接层准入检查。返回 true 表示请求已被拒、调用方应直接收尾。
+ *
+ * 决策全部委托给 `guard.js` 的 `rejectionFor`：双 API 兼容（dsh 0.2.2-rc.3 起
+ * 宿主 publish 的是 `admit(request)`（`{rejection}` 信封），旧宿主是
+ * `requestRejection(req)`（裸状态码）——这里不直调任何一个方法名）+ 结构性
+ * 来源围栏，且承诺任何路径都不抛异常（服务缺席/方法缺失/方法抛错一律视为
+ * 「无决策」，落回围栏）。硬拒时通过 logger 留一行诊断——只有固定字段，
+ * 不带请求头或 URL（日志纪律，设计 §7.5）。
  * @param {object} ctx cordis 上下文。
  * @param {object} req 请求。
  * @param {object} res 响应。
+ * @param {(message: string) => void} [logger] 日志函数（index.js 的 createLogger 产物；可缺省）。
  * @returns {boolean} 是否已拒绝。
  */
-function rejected(ctx, req, res) {
-  const rejection = ctx.connection.requestRejection(req);
-  if (rejection !== undefined) {
-    res.statusCode = rejection;
+function rejected(ctx, req, res, logger) {
+  const status = rejectionFor(
+    ctx,
+    req,
+    typeof logger === 'function'
+      ? (decision) => logger(`reject status=${decision.status} source=${decision.source} reason=${decision.reason}`)
+      : undefined,
+  );
+  if (status !== undefined) {
+    res.statusCode = status;
     res.end();
     return true;
   }
@@ -415,6 +432,7 @@ async function handleChat(getChat, req, res) {
  * @param {object} options.service SshSessionService 实例。
  * @param {object|(() => object|null)} [options.store] HostStore 或其取值函数（分层 inject 下晚到）。
  * @param {object[]} [options.fallbackHosts] 无持久化层时的只读主机表（来自 patch config）。
+ * @param {(message: string) => void} [options.logger] 守卫硬拒的诊断日志（index.js 的 createLogger 产物）。
  * @returns {void}
  */
 export function registerRoutes(ctx, options = {}) {
@@ -489,15 +507,28 @@ export function registerRoutes(ctx, options = {}) {
     return byHost;
   };
 
+  /** 硬拒诊断用日志函数（缺省时守卫只决策、不留日志）。 */
+  const logger = typeof options.logger === 'function' ? options.logger : null;
+
+  /**
+   * 统一的注册包装：全插件所有路由都走这一个 `ctx.webServer.register` 调用点。
+   *
+   * dsh 0.2.2-rc.3 起 register 默认 `auth: 'required'`：没声明的路由会在到达
+   * 本插件 handler 之前就被宿主判 503 `admission unavailable`（非 JSON 体），
+   * 前端解析不了、整个终端面板空白。这里对全部路由显式声明 `auth: 'anonymous'`，
+   * 把准入交回 handler 第一行的 `rejected` 守卫（guard.js：双 API 兼容 +
+   * 结构性来源围栏，SSE/WebSocket 类长连接路由同样走这条包装）。
+   */
   const register = (kind, path, handler) =>
     ctx.effect(
       () =>
         ctx.webServer.register({
           kind,
           path,
+          auth: 'anonymous',
           handler: async (req, res) => {
             // 铁律：准入检查永远是第一件事。
-            if (rejected(ctx, req, res)) return;
+            if (rejected(ctx, req, res, logger)) return;
             try {
               await handler(req, res);
             } catch (error) {

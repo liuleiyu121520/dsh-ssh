@@ -132,6 +132,7 @@ export async function apply(ctx, config = {}) {
   // 底座：路由立刻注册（不依赖任何可选服务）。
   registerRoutes(ctx, {
     service,
+    logger,
     store: () => state.store,
     storageError: () => state.storageError,
     chat: () => state.chat,
